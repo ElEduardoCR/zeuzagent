@@ -467,7 +467,7 @@ ApplicationWindow {
         standardButtons: Dialog.Cancel | Dialog.Ok
         onAccepted: backend.revokeAllDevices()
         contentItem: Text {
-            text: "Todos los iPhone, Raspberry y computadoras emparejados perderán acceso. Se generará un token y un código nuevos."
+            text: "Todos los iPhone, dispositivos Zeuz y computadoras emparejados perderán acceso. Se generará un token y un código nuevos."
             color: textMain
             wrapMode: Text.Wrap
             padding: 16

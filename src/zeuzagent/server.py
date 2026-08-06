@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .config import AgentConfig
+from .dnc_proxy import DNCProxyError, ZeuzDNCProxy
 from .library import LibraryError, ProgramLibrary
 
 
@@ -24,6 +25,7 @@ class ZeuzHTTPServer(ThreadingHTTPServer):
         super().__init__(address, ZeuzRequestHandler)
         self.config = config
         self.library = library
+        self.dnc_proxy = ZeuzDNCProxy()
 
 
 class ZeuzRequestHandler(BaseHTTPRequestHandler):
@@ -112,6 +114,26 @@ class ZeuzRequestHandler(BaseHTTPRequestHandler):
 
         if not self._authorized():
             self._json({"ok": False, "error": "Emparejamiento requerido"}, 401)
+            return
+
+        dnc_routes = {
+            "/v1/dnc/machines": "/api/machines",
+            "/v1/dnc/transfer/status": "/api/transfer/status",
+            "/v1/dnc/device/select": "/api/device/select",
+            "/v1/dnc/machine/select": "/api/machine/select",
+            "/v1/dnc/machine/save": "/api/machine/save",
+            "/v1/dnc/machine/delete": "/api/machine/delete",
+            "/v1/dnc/send": "/api/send",
+            "/v1/dnc/send/cancel": "/api/send/cancel",
+        }
+        if path in dnc_routes:
+            body = self._body() if method in {"POST", "PUT"} else None
+            try:
+                status, payload = self.server.dnc_proxy.forward(method, dnc_routes[path], body)
+            except DNCProxyError as exc:
+                self._json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+            else:
+                self._json(payload, status)
             return
 
         library = self.server.library

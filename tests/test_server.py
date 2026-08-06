@@ -70,7 +70,31 @@ class ServerTests(unittest.TestCase):
             self.request("POST", "/v1/pair", {"code": "000000"})
         self.assertEqual(error.exception.code, 403)
 
+    def test_dnc_requests_are_proxied_through_agent(self) -> None:
+        class FakeProxy:
+            def __init__(self):
+                self.calls = []
+
+            def forward(self, method, path, body=None):
+                self.calls.append((method, path, body))
+                return 200, [{"id": "fanuc", "name": "Fanuc"}]
+
+        proxy = FakeProxy()
+        self.server.dnc_proxy = proxy
+        status, machines = self.request(
+            "GET",
+            "/v1/dnc/machines",
+            token="token-prueba",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(machines[0]["id"], "fanuc")
+        self.assertEqual(proxy.calls, [("GET", "/api/machines", None)])
+
+    def test_dnc_proxy_requires_pairing(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("GET", "/v1/dnc/machines")
+        self.assertEqual(error.exception.code, 401)
+
 
 if __name__ == "__main__":
     unittest.main()
-
