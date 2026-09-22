@@ -612,7 +612,11 @@ class DesktopBackend(QObject):
 
 
 def create_icon(size: int = 128) -> QIcon:
-    return QIcon(str(Path(__file__).resolve().parent / "assets" / "app.png"))
+    # macOS does not mask a QIcon supplied at runtime. Use the same inset,
+    # rounded artwork as the app bundle instead of overriding it with the
+    # full-bleed PNG intended for other surfaces.
+    filename = "AppIcon.icns" if sys.platform == "darwin" else "app.png"
+    return QIcon(str(Path(__file__).resolve().parent / "assets" / filename))
 
 
 def _parser() -> argparse.ArgumentParser:

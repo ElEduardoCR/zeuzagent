@@ -56,7 +56,7 @@ if sys.platform == "darwin":
         name="Zeuz Agent.app",
         icon=str(project / "src" / "zeuzagent" / "assets" / "AppIcon.icns"),
         bundle_identifier="com.zeuz.agent",
-        version="0.4.0",
+        version="0.4.1",
     )
 else:
     exe = EXE(

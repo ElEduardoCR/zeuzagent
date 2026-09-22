@@ -1,5 +1,6 @@
 import os
 import socket
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PySide6.QtWidgets import QApplication
-    from zeuzagent.desktop import DesktopBackend
+    from zeuzagent.desktop import DesktopBackend, create_icon
 except ImportError:
     QApplication = None
     DesktopBackend = None
@@ -22,6 +23,23 @@ class DesktopBackendTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS icon appearance")
+    def test_runtime_icon_keeps_macos_margin_and_rounded_corners(self):
+        # Validate the pixels Qt actually supplies to the Dock, not just the
+        # packaged ICNS: a full-bleed runtime PNG used to override that ICNS.
+        icon = create_icon()
+        self.assertFalse(icon.isNull())
+        for side in (32, 64, 128):
+            image = icon.pixmap(side, side).toImage()
+            self.assertFalse(image.isNull())
+            center = image.width() // 2
+            inset = round(image.width() * .09)
+            self.assertEqual(image.pixelColor(0, 0).alpha(), 0)
+            # Stay clear of the antialiased edge at the 9% inset.
+            self.assertEqual(image.pixelColor(center, image.width() // 25).alpha(), 0)
+            self.assertGreater(image.pixelColor(center, inset + 2).alpha(), 240)
+            self.assertEqual(image.pixelColor(inset, inset).alpha(), 0)
 
     @patch("zeuzagent.runtime.WorkshopSync.start")
     def test_desktop_controls_runtime_and_pairing(self, _sync_start) -> None:
