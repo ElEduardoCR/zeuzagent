@@ -49,7 +49,7 @@ def _load_or_create(path: Path) -> AgentConfig:
 
 def _run(path: Path) -> int:
     config = _load_or_create(path)
-    runtime = AgentRuntime(config)
+    runtime = AgentRuntime(config, path.with_name("machines.json"))
     runtime.start()
     print(f"{config.name} escuchando en http://{config.host}:{config.port}")
     print(f"Carpeta de programas: {config.programs_dir}")

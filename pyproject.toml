@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zeuzagent"
-version = "0.3.0"
+version = "0.4.0"
 description = "Puente local multiplataforma para el ecosistema Zeuz"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,7 +30,7 @@ zeuzagent-ui = "zeuzagent.desktop:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-zeuzagent = ["qml/*.qml"]
+zeuzagent = ["qml/*.qml", "assets/*.svg", "assets/*.png", "assets/*.icns", "assets/*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

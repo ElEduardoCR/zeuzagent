@@ -32,6 +32,8 @@ class AgentConfig:
     api_token: str = ""
     pairing_code: str = ""
     discovery: bool = True
+    program_server_host: str = ""
+    program_server_port: int = 5000
 
     @classmethod
     def create(cls, programs_dir: Path | None = None, name: str | None = None) -> "AgentConfig":

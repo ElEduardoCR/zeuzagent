@@ -8,6 +8,8 @@ from pathlib import Path
 from .config import AgentConfig
 from .discovery import DiscoveryPublisher
 from .library import PollingWatcher, ProgramLibrary
+from .machines import MachineRegistry
+from .workshop import WorkshopSync
 from .server import ZeuzHTTPServer, create_server
 
 
@@ -17,13 +19,15 @@ LOGGER = logging.getLogger("zeuzagent")
 class AgentRuntime:
     """Owns the HTTP server, watcher and mDNS publisher for CLI and desktop use."""
 
-    def __init__(self, config: AgentConfig) -> None:
+    def __init__(self, config: AgentConfig, machines_path: Path | None = None) -> None:
         self._lock = threading.RLock()
         self._config = config
+        self._machines_path = machines_path or Path(config.programs_dir).parent / "machines.json"
         self._server: ZeuzHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
         self._watcher: PollingWatcher | None = None
         self._discovery: DiscoveryPublisher | None = None
+        self._sync = None
         self._discovery_active = False
 
     @property
@@ -61,7 +65,7 @@ class AgentRuntime:
             library = ProgramLibrary(Path(config.programs_dir))
             watcher = PollingWatcher(library)
             discovery = DiscoveryPublisher(config.name, config.port)
-            server = create_server(config, library)
+            server = create_server(config, library, MachineRegistry(self._machines_path))
             thread = threading.Thread(
                 target=server.serve_forever,
                 kwargs={"poll_interval": 0.25},
@@ -74,6 +78,9 @@ class AgentRuntime:
             self._watcher = watcher
             self._discovery = discovery
 
+            self._sync = WorkshopSync(config, server.machines)
+            server.workshop_sync = self._sync
+            self._sync.start()
             watcher.start()
             thread.start()
             try:
@@ -90,6 +97,8 @@ class AgentRuntime:
 
     def stop(self) -> None:
         with self._lock:
+            sync = self._sync
+            self._sync = None
             server = self._server
             thread = self._server_thread
             watcher = self._watcher
@@ -100,6 +109,8 @@ class AgentRuntime:
             self._discovery = None
             self._discovery_active = False
 
+        if sync:
+            sync.stop()
         if server:
             server.shutdown()
             server.server_close()
