@@ -166,7 +166,7 @@ class NativeHost:
             except OSError as exc:
                 self._error = ("El puerto de Zeuz Agent está ocupado. Cierra la versión anterior de Agent "
                                "y vuelve a presionar Iniciar; esta ventana no detuvo el otro servidor."
-                               if exc.errno in {48, 98, 10048} else str(exc))
+                               if exc.errno in {48, 98, 10048} or getattr(exc, "winerror", None) in {10013, 10048} else str(exc))
                 self._status = "Error"
                 self.record("error", self._error)
                 return {"ok": False, "error": self._error}

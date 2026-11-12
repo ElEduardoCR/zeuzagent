@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hmac
 import logging
+import socket
 import threading
 import uuid
 from http import HTTPStatus
@@ -26,6 +27,14 @@ MAX_REQUEST_BYTES = 4 * 1024 * 1024
 
 class ZeuzHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        # Windows SO_REUSEADDR permits a second listener on an occupied port.
+        # One Agent must exclusively own its API and machine routing.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.allow_reuse_address = False
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def __init__(
         self,
