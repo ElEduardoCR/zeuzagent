@@ -25,7 +25,8 @@ def main():
         programs = directory / "programs"
         programs.mkdir()
         content = "O1000\nG21 G90\nM30\n"
-        (programs / "O1000.nc").write_text(content)
+        # Keep the fixture identical on Windows (text mode translates LF to CRLF).
+        (programs / "O1000.nc").write_bytes(content.encode("ascii"))
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
