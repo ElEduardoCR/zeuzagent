@@ -214,10 +214,18 @@ class NativeHost:
         self.record("info", "Configuración guardada")
         return {"ok": True}
 
-    def _library(self):
+    def _library_source(self, source=None):
+        if source not in (None, "local", "server"):
+            raise ValueError("Selecciona la biblioteca local o el servidor del taller")
+        selected = source or ("server" if self._config.program_server_host else "local")
+        if selected == "server" and not self._config.program_server_host:
+            raise ValueError("Selecciona un servidor de programas en Configuración")
+        return selected
+
+    def _library(self, source=None):
         config = self._config
         return (RemoteProgramLibrary(config.program_server_host, config.program_server_port)
-                if config.program_server_host else ProgramLibrary(Path(config.programs_dir)))
+                if self._library_source(source) == "server" else ProgramLibrary(Path(config.programs_dir)))
 
     def _api(self, method, path, body=None):
         if not self._runtime.running:
@@ -335,7 +343,12 @@ class NativeHost:
         sync = self._runtime._sync
         if sync and any(item.get("id") == machine_id for item in sync.conflicts):
             raise ValueError("Resuelve los cambios simultáneos de esta máquina antes de enviar")
-        send_path, name = prepare_program_send(self._config, self._library(), machine, path,
+        source = self._library_source(params.get("source"))
+        # Desktop browsing does not change the shared library used by iZeuz.
+        # A local selection must still stage its original bytes when the global
+        # workshop library happens to be a configured (or offline) server.
+        preparation_config = replace(self._config, program_server_host="") if source == "local" else self._config
+        send_path, name = prepare_program_send(preparation_config, self._library(source), machine, path,
                                                 self._remote, resolve_destination=self._stage_destination)
         # ONLY this request starts RS232. Never repeat an uncertain request.
         try:
@@ -344,10 +357,10 @@ class NativeHost:
             self.record("warning", f"No se confirmó el envío a {machine['name']}; consulta su estado")
             raise TransferUncertain(str(exc) + ". Consulta el estado de la máquina antes de volver a enviar.") from exc
         self.record("info", f"Envío solicitado: {name} → {machine['name']}")
-        return {**result, "path": send_path, "originalPath": path, "machineID": machine_id}
+        return {**result, "path": send_path, "originalPath": path, "machineID": machine_id, "source": source}
 
     def _export(self, params):
-        path, library = str(params.get("path", "")), self._library()
+        path, library = str(params.get("path", "")), self._library(params.get("source"))
         if isinstance(library, ProgramLibrary):
             target = library.resolve(path, must_exist=True)
             if not target.is_file():
@@ -364,7 +377,7 @@ class NativeHost:
         paths = params.get("paths", [])
         if not isinstance(paths, list) or not paths or len(paths) > 200:
             raise ValueError("Selecciona de 1 a 200 programas")
-        folder, library = str(params.get("folder", "")), self._library()
+        folder, library = str(params.get("folder", "")), self._library(params.get("source"))
         library.list(folder)
         imported = []
         for value in paths:
@@ -453,12 +466,13 @@ class NativeHost:
             return self.state()
         if method == "programs.list":
             path, query = str(params.get("path", "")), str(params.get("query", "")).strip()
-            library = self._library()
+            source = self._library_source(params.get("source"))
+            library = self._library(source)
             listing = {"entries": library.search(query), "path": path} if query else library.list(path)
-            return {**listing, "source": "server" if self._config.program_server_host else "local",
+            return {**listing, "source": source,
                     "entries": [{**item, "isDirectory": item.get("kind") == "directory"} for item in listing["entries"]]}
         if method == "programs.read":
-            return self._library().read(str(params.get("path", "")))
+            return self._library(params.get("source")).read(str(params.get("path", "")))
         if method == "programs.export":
             return self._export(params)
         if method == "transfer.status":

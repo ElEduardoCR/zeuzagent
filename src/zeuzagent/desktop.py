@@ -100,6 +100,7 @@ class DesktopBackend(QObject):
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zeuz-desktop")
         self._program_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="zeuz-programs")
         self._program_host = None
+        self._program_scope = "local"
         self._program_entries = []
         self._program_path = ""
         self._program_query = ""
@@ -185,11 +186,30 @@ class DesktopBackend(QObject):
     def programPath(self):
         return self._program_path
 
-    @Property(str, notify=configChanged)
+    @Property(str, notify=programsChanged)
     def programSource(self):
-        if self._config.program_server_host:
+        if self._program_scope == "server" and self._config.program_server_host:
             return "Servidor del taller · " + self._config.program_server_host
         return "Esta computadora · " + self._config.programs_dir
+
+    @Property(str, notify=programsChanged)
+    def programScope(self):
+        return self._program_scope
+
+    @Property(bool, notify=programsChanged)
+    def canChangeProgramScope(self):
+        return not self.transferBusy and not self._transfer_uncertain and not self._program_importing
+
+    @Slot(str)
+    def setProgramScope(self, scope):
+        if not self.canChangeProgramScope or scope not in {"local", "server"}:
+            return
+        if scope == "server" and not self._config.program_server_host:
+            return
+        if scope == self._program_scope:
+            return
+        self._program_scope = scope
+        self.browsePrograms("", "")
 
     @Property(str, notify=programsChanged)
     def programError(self):
@@ -274,7 +294,7 @@ class DesktopBackend(QObject):
         self._program_error = ""
         self._selected_program = {}
         self.programsChanged.emit()
-        self._program_task("list", "programs.list", {"path": path, "query": query}, self._listing_generation)
+        self._program_task("list", "programs.list", {"path": path, "query": query, "source": self._program_scope}, self._listing_generation)
 
     @Slot(str)
     def previewProgram(self, path):
@@ -285,7 +305,7 @@ class DesktopBackend(QObject):
         self._selected_program = {}
         self._program_error = ""
         self.programsChanged.emit()
-        self._program_task("preview", "programs.read", {"path": path}, self._preview_generation)
+        self._program_task("preview", "programs.read", {"path": path, "source": self._program_scope}, self._preview_generation)
 
     @Slot()
     def importPrograms(self):
@@ -305,7 +325,7 @@ class DesktopBackend(QObject):
         self._program_importing = True
         self._program_error = ""
         self.programsChanged.emit()
-        self._program_task("import", "programs.import", {"paths": list(paths), "folder": self._program_path})
+        self._program_task("import", "programs.import", {"paths": list(paths), "folder": self._program_path, "source": self._program_scope})
 
     @Slot(str)
     def setSendMachine(self, machine_id):
@@ -327,7 +347,8 @@ class DesktopBackend(QObject):
         self.programsChanged.emit()
 
     @Slot(str, str)
-    def sendProgram(self, path, machine_id):
+    @Slot(str, str, str)
+    def sendProgram(self, path, machine_id, source=None):
         if self._disposed or self.transferBusy or self._transfer_uncertain:
             return
         machine = self._machines.get(machine_id)
@@ -348,7 +369,7 @@ class DesktopBackend(QObject):
         self._transfer = {"status": "preparing", "filename": Path(path).name, "percent": 0}
         self.transferChanged.emit()
         self.programsChanged.emit()
-        self._program_task("send", "transfer.send", {"path": path, "machineID": machine_id})
+        self._program_task("send", "transfer.send", {"path": path, "machineID": machine_id, "source": source or self._program_scope})
 
     @Slot()
     def refreshTransfer(self):

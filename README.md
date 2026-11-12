@@ -8,8 +8,10 @@ publica una API HTTP local versionada y se anuncia por Bonjour/mDNS.
 
 La pestaña **Programas** de la interfaz Windows/Linux permite navegar por
 carpetas, buscar nombres, consultar el código e importar archivos. Muestra la
-biblioteca del servidor seleccionado; si no hay servidor, usa la carpeta de la
-computadora. La importación conserva los bytes originales y agrega un sufijo
+biblioteca de **Esta computadora** de forma predeterminada. El selector también
+permite ver el **Servidor del taller** cuando está configurado, sin cambiar la
+biblioteca que comparten el iPhone y los equipos Zeuz. La importación conserva
+los bytes originales y agrega un sufijo
 cuando el nombre ya existe. La vista previa muestra hasta 2 MiB; el envío usa
 el programa completo.
 

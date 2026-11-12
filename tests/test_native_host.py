@@ -85,6 +85,43 @@ class NativeHostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "texto CNC"):
             self.host.handle("programs.import", {"paths": [str(outside)]})
 
+    def test_explicit_local_operations_keep_global_shared_configuration(self):
+        configured = replace(self.config, program_server_host="offline-shared.invalid", program_server_port=5001)
+        configured.save(self.config_path)
+        self.host._config = configured
+        original_configuration = self.config_path.read_bytes()
+        raw = b"%\r\nO1\r\n(COMENTARIO \xf1)\r\nM30\r\n"
+        (self.programs / "O1.nc").write_bytes(raw)
+        incoming = self.root / "O2.nc"
+        incoming.write_bytes(raw.replace(b"O1", b"O2"))
+        # An offline shared server must not even be constructed for PC actions.
+        with patch("zeuzagent.native_host.RemoteProgramLibrary", side_effect=AssertionError("Unexpected remote library")):
+            listing = self.host.handle("programs.list", {"source": "local"})
+            self.assertEqual(listing["source"], "local")
+            self.assertEqual(listing["entries"][0]["path"], "O1.nc")
+            preview = self.host.handle("programs.read", {"source": "local", "path": "O1.nc"})
+            self.assertEqual(preview["content"].encode("latin-1"), raw)
+            exported = self.host.handle("programs.export", {"source": "local", "path": "O1.nc"})
+            self.assertEqual(Path(exported["path"]), (self.programs / "O1.nc").resolve())
+            self.assertFalse(exported["temporary"])
+            imported = self.host.handle("programs.import", {"source": "local", "paths": [str(incoming)]})
+            self.assertEqual(imported["paths"], ["O2.nc"])
+        self.assertEqual((self.programs / "O2.nc").read_bytes(), incoming.read_bytes())
+        self.assertEqual(self.config_path.read_bytes(), original_configuration)
+        self.assertIs(self.host._config, configured)
+
+    def test_source_is_optional_but_explicit_server_requires_configuration(self):
+        with self.assertRaisesRegex(ValueError, "servidor"):
+            self.host.handle("programs.list", {"source": "server"})
+        with self.assertRaisesRegex(ValueError, "biblioteca"):
+            self.host.handle("programs.read", {"source": "invalid", "path": "O1.nc"})
+        self.host._config = replace(self.config, program_server_host="shared.local")
+        with patch("zeuzagent.native_host.RemoteProgramLibrary") as remote:
+            remote.return_value.list.return_value = {"path": "", "entries": []}
+            self.assertEqual(self.host.handle("programs.list")["source"], "server")
+            self.assertEqual(self.host.handle("programs.list", {"source": "server"})["source"], "server")
+            self.assertEqual(remote.call_count, 2)
+
     def test_injected_runtime_does_not_start_or_stop_external_owner(self):
         injected = NativeHost(self.config_path, runtime=self.host._runtime)
         try:
@@ -152,6 +189,38 @@ class NativeHostTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "archivo completo"):
                 self.host.handle("transfer.send", {"path": "O1.nc", "machineID": "fadal"})
             api.assert_not_called()
+
+    def test_explicit_local_send_stages_pc_bytes_with_global_shared_server(self):
+        self.machine()
+        configured = replace(self.config, program_server_host="offline-shared.invalid")
+        configured.save(self.config_path)
+        self.host._config = configured
+        original_configuration = self.config_path.read_bytes()
+        raw = b"%\r\nO1234\r\n" + b"G1 X1.\r\n" * (MAX_PREVIEW_BYTES // 8 + 10)
+        (self.programs / "O1234.nc").write_bytes(raw)
+        mirrored = []
+        def remote(method, path, body, endpoint):
+            if path == "/api/info":
+                return {"service": "zeuz-dnc", "agent_configured": False}
+            if path == "/api/workshop/info":
+                return {"program_server": "http://actual-workshop.local:5002" if endpoint.host == "127.0.0.1" else ""}
+            if path == "/api/workshop/mirror":
+                self.assertEqual((endpoint.host, endpoint.port), ("actual-workshop.local", 5002))
+                self.assertEqual(base64.b64decode(body["data"]), raw)
+                mirrored.append(body["path"])
+                return {"ok": True, "sha256": hashlib.sha256(raw).hexdigest()}
+            self.fail(path)
+        with patch.object(AgentRuntime, "running", property(lambda _: True)), \
+             patch("zeuzagent.native_host.RemoteProgramLibrary", side_effect=AssertionError("Unexpected shared read")), \
+             patch.object(self.host, "_remote", side_effect=remote), \
+             patch.object(self.host, "_api", return_value={"ok": True}) as api:
+            result = self.host.handle("transfer.send", {"source": "local", "path": "O1234.nc", "machineID": "fadal"})
+        self.assertEqual(result["source"], "local")
+        self.assertEqual(mirrored, [result["path"]])
+        self.assertTrue(result["path"].startswith("Agent Transfers/"))
+        api.assert_called_once_with("POST", "/v1/dnc/send", {"path": result["path"], "machine_id": "fadal"})
+        self.assertIs(self.host._config, configured)
+        self.assertEqual(self.config_path.read_bytes(), original_configuration)
 
     def test_uncertain_send_propagates_without_repeating(self):
         self.machine()

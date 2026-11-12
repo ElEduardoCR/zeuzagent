@@ -312,6 +312,25 @@ ApplicationWindow {
 
         RowLayout {
             Layout.fillWidth: true
+            ComboBox {
+                id: programScopeBox
+                objectName: "programScopeBox"
+                Layout.preferredWidth: 185
+                model: backend.programServer.length ? [{label: "Esta computadora", scope: "local"}, {label: "Servidor del taller", scope: "server"}] : [{label: "Esta computadora", scope: "local"}]
+                textRole: "label"
+                valueRole: "scope"
+                currentIndex: backend.programScope === "server" ? 1 : 0
+                enabled: backend.canChangeProgramScope
+                Accessible.name: "Origen de los programas de escritorio"
+                onActivated: { programSearchField.text = ""; backend.setProgramScope(currentValue) }
+                indicator: Text {
+                    x: parent.width - width - 8
+                    y: (parent.height - height) / 2
+                    text: "⌄"
+                    font.pixelSize: 20
+                    color: parent.enabled ? textMain : disabledText
+                }
+            }
             TextButton {
                 text: "↑ Subir"
                 enabled: backend.programPath.length > 0 && !backend.programBusy
@@ -551,7 +570,7 @@ ApplicationWindow {
                         onClicked: {
                             var machine = backend.machines.find(function(item) { return item.id === backend.sendMachineId })
                             if (!machine) return
-                            pendingSend = {path: backend.selectedProgram.path, name: backend.selectedProgram.name, machineID: machine.id, machineName: machine.name}
+                            pendingSend = {path: backend.selectedProgram.path, name: backend.selectedProgram.name, machineID: machine.id, machineName: machine.name, source: backend.programScope}
                             sendProgramDialog.open()
                         }
                     }
@@ -592,7 +611,7 @@ ApplicationWindow {
             wrapMode: Text.Wrap
             text: "Se enviará «" + (pendingSend.name || "") + "» a «" + (pendingSend.machineName || "") + "».\n\nPon el control de la CNC en recepción antes de continuar."
         }
-        onAccepted: backend.sendProgram(pendingSend.path, pendingSend.machineID)
+        onAccepted: backend.sendProgram(pendingSend.path, pendingSend.machineID, pendingSend.source)
     }
 
     ScrollView {

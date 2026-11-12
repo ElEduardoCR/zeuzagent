@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,7 @@ try:
     from PySide6.QtCore import QUrl
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QSignalSpy
     from zeuzagent.desktop import DesktopBackend
 except ImportError:
     QApplication = None
@@ -153,6 +155,53 @@ class DesktopProgramTests(unittest.TestCase):
         self.wait_until(lambda: not self.backend.programBusy)
         self.assertTrue(self.backend.selectedProgram["truncated"])
 
+    def test_local_programs_remain_available_with_offline_shared_server(self):
+        (self.programs / "O9.nc").write_bytes(b"O9\nM30\n")
+        config = replace(self.backend._config, program_server_host="unavailable.invalid")
+        original_server = config.program_server_host
+        with patch("zeuzagent.remote_library.RemoteProgramLibrary.request", side_effect=AssertionError("Local browser contacted the shared server")):
+            self.assertTrue(self.backend._save_config(config))
+            self.wait_until(lambda: not self.backend.programBusy)
+            self.assertEqual(self.backend.programScope, "local")
+            self.assertEqual(self.backend.programEntries[0]["path"], "O9.nc")
+            self.backend.previewProgram("O9.nc")
+            self.wait_until(lambda: not self.backend.programBusy)
+            self.assertEqual(self.backend.selectedProgram["content"], "O9\nM30\n")
+            outside = self.root / "O10.nc"
+            outside.write_bytes(b"O10\nM30\n")
+            self.backend.importProgramPaths([str(outside)])
+            self.wait_until(lambda: not self.backend.programBusy)
+            self.assertEqual((self.programs / "O10.nc").read_bytes(), outside.read_bytes())
+        self.assertEqual(AgentConfig.load(self.config_path).program_server_host, original_server)
+
+    def test_late_server_response_cannot_replace_new_local_browser(self):
+        (self.programs / "LOCAL.nc").write_bytes(b"O1\nM30\n")
+        self.backend._save_config(replace(self.backend._config, program_server_host="unavailable.invalid"))
+        self.wait_until(lambda: not self.backend.programBusy)
+        service = self.backend._program_service()
+        original_dispatch = service.dispatch
+        entered, release = threading.Event(), threading.Event()
+        results = QSignalSpy(self.backend._programResult)
+        def dispatch(method, params):
+            if method == "programs.list" and params.get("source") == "server":
+                entered.set()
+                release.wait(5)
+                return {"entries": [{"name": "REMOTE.nc", "path": "REMOTE.nc", "isDirectory": False, "size": 1, "modified": 0}]}
+            return original_dispatch(method, params)
+        with patch.object(service, "dispatch", side_effect=dispatch):
+            try:
+                self.backend.setProgramScope("server")
+                self.wait_until(entered.is_set)
+                self.backend.setProgramScope("local")
+                self.wait_until(lambda: not self.backend.programBusy)
+                release.set()
+                self.wait_until(lambda: results.count() >= 2)
+                self.assertEqual(self.backend.programScope, "local")
+                self.assertEqual([item["name"] for item in self.backend.programEntries], ["LOCAL.nc"])
+                self.assertEqual(self.backend.programError, "")
+            finally:
+                release.set()
+
     def test_full_program_send_pins_machine_then_cancels_same_target(self):
         self.fake_zeuz()
         raw = b"O1\n" + b"G1 X1.\n" * (MAX_PREVIEW_BYTES // 7 + 10)
@@ -175,6 +224,32 @@ class DesktopProgramTests(unittest.TestCase):
         self.assertEqual(len([call for call in self.calls if call[0] == "/api/send/cancel"]), 1)
         self.backend.setSendMachine("other")
         self.assertEqual(self.backend.sendMachineId, "other")
+
+    def test_confirmed_local_source_survives_browser_switch_without_changing_shared_server(self):
+        self.backend._save_config(replace(self.backend._config, program_server_host="unavailable.invalid"))
+        self.wait_until(lambda: not self.backend.programBusy)
+        self.fake_zeuz()
+        raw = b"O1\nG21 G90\nM30\n"
+        (self.programs / "O1.nc").write_bytes(raw)
+        self.backend.previewProgram("O1.nc")
+        self.wait_until(lambda: not self.backend.programBusy)
+        confirmed_source = self.backend.programScope
+        service = self.backend._program_service()
+        dispatch = service.dispatch
+        def read_empty_server(method, params):
+            if method == "programs.list" and params.get("source") == "server":
+                return {"entries": []}
+            return dispatch(method, params)
+        with patch.object(service, "dispatch", side_effect=read_empty_server):
+            self.backend.setProgramScope("server")
+            self.wait_until(lambda: not self.backend.programBusy)
+            self.backend.sendProgram("O1.nc", "fadal", confirmed_source)
+            self.wait_until(lambda: not self.backend._transfer_pending and not self.backend.transferPolling)
+        self.assertEqual(next(iter(self.staged.values())), raw)
+        self.assertFalse(self.backend.canChangeProgramScope)
+        self.backend.setProgramScope("local")
+        self.assertEqual(self.backend.programScope, "server")
+        self.assertEqual(AgentConfig.load(self.config_path).program_server_host, "unavailable.invalid")
 
     def test_uncertain_send_and_failed_status_never_repeat_command(self):
         self.fake_zeuz()
