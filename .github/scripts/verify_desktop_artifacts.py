@@ -19,7 +19,8 @@ def main():
     agent = root / "dist" / ("ZeuzAgent" + extension)
     edit = root / "dist" / "ZeuzEdit" / ("ZeuzEdit" + extension)
     result = {"platform": sys.platform, "agent": False, "edit": False}
-    environment = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "QT_QUICK_CONTROLS_STYLE": "Basic"}
+    environment = {**os.environ, "QT_QPA_PLATFORM": "windows" if os.name == "nt" else "offscreen",
+                   "QT_QUICK_BACKEND": "software", "QT_QUICK_CONTROLS_STYLE": "Basic"}
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         programs = directory / "programs"
