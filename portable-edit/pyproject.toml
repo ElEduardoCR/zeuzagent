@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zeuzedit-desktop"
+version = "0.2.0"
+description = "ZEUZ Edit para Windows y Linux con envío mediante Zeuz Agent"
+requires-python = ">=3.10"
+dependencies = ["PySide6>=6.7,<7"]
+
+[project.optional-dependencies]
+package = ["PyInstaller>=6,<7", "Pillow>=10,<13"]
+
+[project.scripts]
+zeuzedit = "zeuzedit_desktop.ui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+zeuzedit_desktop = ["assets/*.png", "assets/*.svg"]

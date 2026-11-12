@@ -52,6 +52,11 @@ class AgentRuntime:
                 return int(self._server.server_port)
             return self._config.port
 
+    @property
+    def presetter_clients(self) -> list[dict]:
+        with self._lock:
+            return self._server.presetter_clients.list() if self._server else []
+
     def replace_config(self, **changes: object) -> AgentConfig:
         with self._lock:
             self._config = replace(self._config, **changes)
@@ -64,8 +69,8 @@ class AgentRuntime:
             config = self._config
             library = ProgramLibrary(Path(config.programs_dir))
             watcher = PollingWatcher(library)
-            discovery = DiscoveryPublisher(config.name, config.port)
             server = create_server(config, library, MachineRegistry(self._machines_path))
+            discovery = DiscoveryPublisher(config.name, server.server_port)
             thread = threading.Thread(
                 target=server.serve_forever,
                 kwargs={"poll_interval": 0.25},

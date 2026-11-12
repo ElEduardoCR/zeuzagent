@@ -4,6 +4,7 @@ import json
 import hmac
 import logging
 import threading
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +16,8 @@ from .config import AgentConfig
 from .dnc_proxy import DNCEndpoint, DNCProxyError, ZeuzDNCProxy
 from .library import LibraryError, ProgramLibrary
 from .machines import MachineError, MachineRegistry, serial_profile
+from .presetter import CAPABILITIES, PresetterClients, validate_upload
+from .transfer_preparation import ProgramPreparationError, prepare_program_send
 
 
 LOGGER = logging.getLogger("zeuzagent")
@@ -40,6 +43,7 @@ class ZeuzHTTPServer(ThreadingHTTPServer):
         self.workshop_sync = None
         self.selected_machine_id: str | None = None
         self.selection_lock = threading.Lock()
+        self.presetter_clients = PresetterClients()
 
 
 class ZeuzRequestHandler(BaseHTTPRequestHandler):
@@ -107,6 +111,7 @@ class ZeuzRequestHandler(BaseHTTPRequestHandler):
                     "version": __version__,
                     "api_version": 1,
                     "pairing_required": True,
+                    "capabilities": CAPABILITIES,
                 }
             )
             return
@@ -128,6 +133,54 @@ class ZeuzRequestHandler(BaseHTTPRequestHandler):
 
         if not self._authorized():
             self._json({"ok": False, "error": "Emparejamiento requerido"}, 401)
+            return
+
+        if path == "/v1/presetter/register" and method == "POST":
+            result = self.server.presetter_clients.register(self._body(), self.client_address[0])
+            self._json(result)
+            return
+        if path == "/v1/presetter/clients" and method == "GET":
+            self._json({"clients": self.server.presetter_clients.list()})
+            return
+        if path == "/v1/presetter/targets" and method == "GET":
+            # The Agent's machine registry owns routing. Caller-supplied hosts
+            # are never used to choose an upload destination.
+            keys = ("id", "name", "dnc_host", "dnc_port")
+            self._json({"targets": [{key: machine.get(key) for key in keys} for machine in self.server.machines.list()]})
+            return
+        if path == "/v1/presetter/jobs" and method == "POST":
+            machine_id, filename, content = validate_upload(self._body())
+            machine = self.server.machines.get(machine_id)
+            if not machine:
+                raise MachineError("La máquina destino ya no existe en Zeuz Agent")
+            job_id = uuid.uuid4().hex
+            destination = f"Presetter/{job_id[:12]}-{filename}"
+            # A configured workshop server is the library that the selected
+            # Zeuz actually presents. A private local copy on that Pi would not
+            # appear in its active catalog while it uses the shared server.
+            shared_host = self.server.config.program_server_host
+            library_host = shared_host or machine["dnc_host"]
+            library_port = self.server.config.program_server_port if shared_host else int(machine["dnc_port"])
+            endpoint = DNCEndpoint(library_host, library_port, machine["name"])
+            try:
+                status, payload = self.server.dnc_proxy.forward(
+                    "PUT", "/api/workshop/content", {"path": destination, "content": content}, endpoint,
+                )
+            except DNCProxyError as exc:
+                self._json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+                return
+            if status >= 300 or not isinstance(payload, dict) or payload.get("ok") is not True:
+                error = payload.get("error", "El equipo no confirmó la carga de seteos") if isinstance(payload, dict) else "Respuesta inválida del equipo"
+                self._json({"ok": False, "error": error}, status if status >= 400 else HTTPStatus.BAD_GATEWAY)
+                return
+            LOGGER.info("Seteos Presetter guardados en %s: %s", machine["name"], destination)
+            self._json({
+                "ok": True, "job_id": job_id, "machine_id": machine_id,
+                "machine_name": machine["name"], "path": destination,
+                "library_host": library_host, "library_port": library_port,
+                "storage_scope": "workshop" if shared_host else "device",
+                "status": "stored", "cnc_transmission_started": False,
+            }, HTTPStatus.CREATED)
             return
 
         if path == "/v1/workshop" and method == "GET":
@@ -191,11 +244,17 @@ class ZeuzRequestHandler(BaseHTTPRequestHandler):
             self._body()
             self._json({"ok": True, "deprecated": True})
             return
-        if path in {"/v1/dnc/transfer/status", "/v1/dnc/send", "/v1/dnc/send/cancel"}:
+        if path == "/v1/dnc/program/send" and method != "POST":
+            self._json({"ok": False, "error": "Usa POST para enviar un programa"}, 405)
+            return
+        if path in {"/v1/dnc/transfer/status", "/v1/dnc/send", "/v1/dnc/program/send", "/v1/dnc/send/cancel"}:
             body = self._body() if method in {"POST", "PUT"} else None
             requested_machine_id = str(
                 (body or {}).get("machine_id") or _first(query, "machine_id") or ""
             )
+            desktop_send = path == "/v1/dnc/program/send"
+            if desktop_send and not requested_machine_id:
+                raise MachineError("Selecciona una máquina explícita antes de enviar")
             with self.server.selection_lock:
                 selected_machine_id = self.server.selected_machine_id
             machine = self.server.machines.get(requested_machine_id or selected_machine_id)
@@ -205,10 +264,46 @@ class ZeuzRequestHandler(BaseHTTPRequestHandler):
             dnc_path = {
                 "/v1/dnc/transfer/status": "/api/transfer/status",
                 "/v1/dnc/send": "/api/send",
+                "/v1/dnc/program/send": "/api/send",
                 "/v1/dnc/send/cancel": "/api/send/cancel",
             }[path]
-            if path == "/v1/dnc/send":
-                status, profiles = self.server.dnc_proxy.forward("GET", "/api/workshop/machines", endpoint=endpoint)
+            send_metadata = None
+            if desktop_send:
+                sync = self.server.workshop_sync
+                if sync and any(item.get("id") == machine["id"] for item in sync.conflicts):
+                    raise MachineError("Resuelve los cambios simultáneos de esta máquina antes de enviar")
+
+                def prepare_request(verb, route, value, target):
+                    status, payload = self.server.dnc_proxy.forward(verb, route, value, target)
+                    if status >= 300 or (isinstance(payload, dict) and payload.get("ok") is False):
+                        raise ProgramPreparationError(payload.get("error", "Zeuz no confirmó la preparación del programa")
+                                                      if isinstance(payload, dict) else "Respuesta de Zeuz inválida")
+                    return payload
+
+                original_path = str((body or {}).get("path", ""))
+                try:
+                    prepared_path, filename = prepare_program_send(self.server.config, self.server.library,
+                        machine, original_path, prepare_request)
+                except LibraryError:
+                    raise
+                except Exception as exc:
+                    raise ProgramPreparationError(str(exc)) from exc
+                body = {**(body or {}), "path": prepared_path}
+                send_metadata = {"path": prepared_path, "original_path": original_path,
+                                 "machine_id": machine["id"], "filename": filename}
+            if path in {"/v1/dnc/send", "/v1/dnc/program/send"}:
+                try:
+                    status, profiles = self.server.dnc_proxy.forward("GET", "/api/workshop/machines", endpoint=endpoint)
+                except DNCProxyError as exc:
+                    if desktop_send:
+                        raise ProgramPreparationError(str(exc)) from exc
+                    raise
+                if desktop_send and status != 200:
+                    raise ProgramPreparationError("No se pudo confirmar el perfil de la máquina; no se inició el envío")
+                if desktop_send and isinstance(profiles, list) and any(not isinstance(item, dict) for item in profiles):
+                    raise MachineError("Respuesta de perfiles inválida")
+                if desktop_send and self.server.machines.get(machine["id"]) != machine:
+                    raise MachineError("El perfil cambió durante la preparación. Revisa la máquina antes de enviar.")
                 if status == 200 and not isinstance(profiles, list):
                     raise MachineError("Respuesta de perfiles inválida")
                 if status == 200:
@@ -230,8 +325,10 @@ class ZeuzRequestHandler(BaseHTTPRequestHandler):
             try:
                 status, payload = self.server.dnc_proxy.forward(method, dnc_path, body, endpoint)
             except DNCProxyError as exc:
-                self._json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+                self._json({"ok": False, "error": str(exc), **({"uncertain": True} if desktop_send else {})}, HTTPStatus.BAD_GATEWAY)
             else:
+                if send_metadata and status < 300 and isinstance(payload, dict) and payload.get("ok") is not False:
+                    payload = {**payload, **send_metadata}
                 self._json(payload, status)
             return
 

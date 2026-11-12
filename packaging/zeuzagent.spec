@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import sys
+import ssl
 from pathlib import Path
 
 project = Path(SPECPATH).parent
@@ -10,6 +11,11 @@ datas = [
     ),
     (str(project / "src" / "zeuzagent" / "assets"), "zeuzagent/assets"),
 ]
+# Some managed Python runtimes add a trust-store file beside ssl.py. Preserve
+# that runtime's verification behavior in the frozen executable when present.
+runtime_trust_store = Path(ssl.__file__).with_name("codex-rejected-cas.pem")
+if runtime_trust_store.is_file():
+    datas.append((str(runtime_trust_store), "."))
 
 a = Analysis(
     [str(project / "packaging" / "desktop_entry.py")],
@@ -56,7 +62,7 @@ if sys.platform == "darwin":
         name="Zeuz Agent.app",
         icon=str(project / "src" / "zeuzagent" / "assets" / "AppIcon.icns"),
         bundle_identifier="com.zeuz.agent",
-        version="0.4.1",
+        version="0.5.0",
     )
 else:
     exe = EXE(

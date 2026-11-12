@@ -82,9 +82,13 @@ class DesktopBackend(QObject):
     machinesChanged = Signal()
     devicesChanged = Signal()
     syncChanged = Signal()
+    presetterClientsChanged = Signal()
     _devicesFound = Signal(object)
     _backgroundError = Signal(str)
     _updateFound = Signal(str, int, object)
+    programsChanged = Signal()
+    transferChanged = Signal()
+    _programResult = Signal(object)
 
     def __init__(self, config_path: Path, tray_available: bool | None = None) -> None:
         super().__init__()
@@ -94,6 +98,36 @@ class DesktopBackend(QObject):
         self._machines = MachineRegistry(self._machines_path)
         self._runtime = AgentRuntime(config, self._machines_path)
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zeuz-desktop")
+        self._program_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="zeuz-programs")
+        self._program_host = None
+        self._program_entries = []
+        self._program_path = ""
+        self._program_query = ""
+        self._program_error = ""
+        self._program_listing = False
+        self._program_preview_loading = False
+        self._program_importing = False
+        self._listing_generation = 0
+        self._preview_generation = 0
+        self._selected_program = {}
+        self._send_machine_id = ""
+        self._transfer = {"status": "idle", "percent": 0}
+        self._transfer_machine_id = ""
+        self._transfer_machine_name = ""
+        self._transfer_pending = False
+        self._transfer_polling = False
+        self._transfer_uncertain = False
+        self._transfer_started = False
+        self._send_acknowledged = False
+        self._observed_transfer = False
+        self._cancel_acknowledged = False
+        self._transfer_expected_filename = ""
+        self._transfer_message = "Selecciona un programa y la CNC que lo recibirá."
+        self._programResult.connect(self._apply_program_result)
+        self._transfer_timer = QTimer(self)
+        self._transfer_timer.setInterval(1500)
+        self._transfer_timer.timeout.connect(self.refreshTransfer)
+        self._transfer_timer.start()
         self._discovering = False
         self._devicesFound.connect(self._apply_devices)
         self._updateFound.connect(self._apply_update)
@@ -112,6 +146,7 @@ class DesktopBackend(QObject):
         self._update_timer.timeout.connect(self.refreshUpdates)
         self._update_timer.start()
         self._machine_snapshot = []
+        self._presetter_snapshot = []
         self._device_directory = DeviceDirectory(self._config_path.with_name("devices.json"))
         try:
             self._devices = self._device_directory.load()
@@ -140,6 +175,291 @@ class DesktopBackend(QObject):
         if created:
             self._record("info", f"Configuración creada en {self._config_path}")
         self._record("info", f"Zeuz Agent {__version__} listo")
+        QTimer.singleShot(0, lambda: self.browsePrograms("", "") if not self._disposed else None)
+
+    @Property("QVariantList", notify=programsChanged)
+    def programEntries(self):
+        return self._program_entries
+
+    @Property(str, notify=programsChanged)
+    def programPath(self):
+        return self._program_path
+
+    @Property(str, notify=configChanged)
+    def programSource(self):
+        if self._config.program_server_host:
+            return "Servidor del taller · " + self._config.program_server_host
+        return "Esta computadora · " + self._config.programs_dir
+
+    @Property(str, notify=programsChanged)
+    def programError(self):
+        return self._program_error
+
+    @Property(bool, notify=programsChanged)
+    def programBusy(self):
+        return self._program_listing or self._program_preview_loading or self._program_importing
+
+    @Property("QVariantMap", notify=programsChanged)
+    def selectedProgram(self):
+        return self._selected_program
+
+    @Property(str, notify=transferChanged)
+    def sendMachineId(self):
+        return self._send_machine_id
+
+    @Property("QVariantMap", notify=transferChanged)
+    def transfer(self):
+        return self._transfer
+
+    @Property(str, notify=transferChanged)
+    def transferMachineId(self):
+        return self._transfer_machine_id
+
+    @Property(bool, notify=transferChanged)
+    def transferBusy(self):
+        return self._transfer_pending or self._transfer.get("status") == "sending"
+
+    @Property(bool, notify=transferChanged)
+    def transferPolling(self):
+        return self._transfer_polling
+
+    @Property(bool, notify=transferChanged)
+    def transferUncertain(self):
+        return self._transfer_uncertain
+
+    @Property(str, notify=transferChanged)
+    def transferMessage(self):
+        return self._transfer_message
+
+    @Property(bool, notify=programsChanged)
+    def canSendProgram(self):
+        return bool(
+            self.running and self._selected_program.get("path") and self._send_machine_id
+            and not self.programBusy and not self.transferBusy and not self._transfer_uncertain and not self._transfer_polling
+            and self._machines.get(self._send_machine_id)
+        )
+
+    def _program_service(self):
+        # The same service is used by SwiftUI through JSONL and by Qt in process.
+        # It borrows this window's runtime; there is only one HTTP server.
+        if self._program_host is None:
+            from .native_host import NativeHost
+            self._program_host = NativeHost(self._config_path, runtime=self._runtime)
+        return self._program_host
+
+    def _program_task(self, kind, method, params, generation=0):
+        try:
+            service = self._program_service()
+        except Exception as exc:
+            self._programResult.emit({"kind": kind, "generation": generation, "error": str(exc)})
+            return
+        def work():
+            try:
+                result = service.dispatch(method, params)
+                self._programResult.emit({"kind": kind, "generation": generation, "result": result})
+            except Exception as exc:
+                self._programResult.emit({"kind": kind, "generation": generation, "error": str(exc), "uncertain": bool(getattr(exc, "uncertain", False))})
+        self._program_executor.submit(work)
+
+    @Slot(str, str)
+    def browsePrograms(self, path="", query=""):
+        if self._disposed:
+            return
+        self._listing_generation += 1
+        self._preview_generation += 1
+        self._program_path = path
+        self._program_query = query
+        self._program_listing = True
+        self._program_preview_loading = False
+        self._program_error = ""
+        self._selected_program = {}
+        self.programsChanged.emit()
+        self._program_task("list", "programs.list", {"path": path, "query": query}, self._listing_generation)
+
+    @Slot(str)
+    def previewProgram(self, path):
+        if self._disposed:
+            return
+        self._preview_generation += 1
+        self._program_preview_loading = True
+        self._selected_program = {}
+        self._program_error = ""
+        self.programsChanged.emit()
+        self._program_task("preview", "programs.read", {"path": path}, self._preview_generation)
+
+    @Slot()
+    def importPrograms(self):
+        if self.programBusy or self.transferBusy:
+            return
+        paths, _filter = QFileDialog.getOpenFileNames(
+            None, "Importar programas CNC", self._config.programs_dir,
+            "Programas CNC (*.nc *.tap *.txt *.gcode *.cnc *.min *.eia *.iso *.mpf *.spf *.prg *.dnc);;Todos los archivos (*)"
+        )
+        if paths:
+            self.importProgramPaths(paths)
+
+    def importProgramPaths(self, paths):
+        """Shared by the file chooser and the isolated UI regression tests."""
+        if self._disposed or self._program_importing:
+            return
+        self._program_importing = True
+        self._program_error = ""
+        self.programsChanged.emit()
+        self._program_task("import", "programs.import", {"paths": list(paths), "folder": self._program_path})
+
+    @Slot(str)
+    def setSendMachine(self, machine_id):
+        if self.transferBusy or self._transfer_uncertain:
+            return
+        if machine_id and not self._machines.get(machine_id):
+            return
+        self._send_machine_id = machine_id
+        self._transfer_machine_id = ""
+        self._transfer_machine_name = ""
+        self._transfer_started = False
+        self._send_acknowledged = False
+        self._observed_transfer = False
+        self._cancel_acknowledged = False
+        self._transfer_expected_filename = ""
+        self._transfer = {"status": "idle", "percent": 0}
+        self._transfer_message = "Lista para enviar. Pon la CNC en recepción."
+        self.transferChanged.emit()
+        self.programsChanged.emit()
+
+    @Slot(str, str)
+    def sendProgram(self, path, machine_id):
+        if self._disposed or self.transferBusy or self._transfer_uncertain:
+            return
+        machine = self._machines.get(machine_id)
+        if not self.running or not machine or not path:
+            self._program_error = "Inicia Agent y selecciona un programa y una máquina válidos."
+            self.programsChanged.emit()
+            return
+        self._transfer_pending = True
+        self._transfer_started = True
+        self._send_acknowledged = False
+        self._observed_transfer = False
+        self._cancel_acknowledged = False
+        self._transfer_expected_filename = Path(path).name
+        self._program_error = ""
+        self._transfer_machine_id = machine_id
+        self._transfer_machine_name = machine["name"]
+        self._transfer_message = "Preparando " + Path(path).name + " para " + machine["name"] + "…"
+        self._transfer = {"status": "preparing", "filename": Path(path).name, "percent": 0}
+        self.transferChanged.emit()
+        self.programsChanged.emit()
+        self._program_task("send", "transfer.send", {"path": path, "machineID": machine_id})
+
+    @Slot()
+    def refreshTransfer(self):
+        target = self._transfer_machine_id or self._send_machine_id
+        if self._disposed or not target or self._transfer_polling or self._transfer_pending:
+            return
+        self._transfer_polling = True
+        self.transferChanged.emit()
+        self._program_task("status", "transfer.status", {"machineID": target}, target)
+
+    @Slot()
+    def cancelTransfer(self):
+        if self._disposed or not self._transfer_machine_id or self._transfer_polling:
+            return
+        self._transfer_polling = True
+        self._transfer_message = "Solicitando cancelación en " + self._transfer_machine_name + "…"
+        self.transferChanged.emit()
+        self._program_task("cancel", "transfer.cancel", {"machineID": self._transfer_machine_id})
+
+    @Slot(object)
+    def _apply_program_result(self, value):
+        if self._disposed:
+            return
+        kind, error = value["kind"], value.get("error", "")
+        result = value.get("result") or {}
+        if kind == "list":
+            if value["generation"] != self._listing_generation:
+                return
+            self._program_listing = False
+            self._program_error = error
+            self._program_entries = [] if error else result.get("entries", [])
+            self.programsChanged.emit()
+        elif kind == "preview":
+            if value["generation"] != self._preview_generation:
+                return
+            self._program_preview_loading = False
+            self._program_error = error
+            self._selected_program = {} if error else result
+            self.programsChanged.emit()
+        elif kind == "import":
+            self._program_importing = False
+            if error:
+                self._program_error = error
+                self.programsChanged.emit()
+            else:
+                self._record("info", "Programas importados a la biblioteca activa")
+                self.browsePrograms(self._program_path, self._program_query)
+        elif kind == "send":
+            self._transfer_pending = False
+            if error:
+                self._transfer_uncertain = bool(value.get("uncertain"))
+                self._transfer_started = self._transfer_uncertain
+                self._transfer = {**self._transfer, "status": "unknown" if self._transfer_uncertain else "error"}
+                self._transfer_message = ("No se confirmó el envío a " if self._transfer_uncertain else "No se inició el envío a ") + self._transfer_machine_name + ". " + error
+                self._program_error = error
+            else:
+                self._send_acknowledged = True
+                self._transfer = {**self._transfer, "status": "sending"}
+                self._transfer_message = "Envío solicitado a " + self._transfer_machine_name + ". Consultando progreso…"
+            self.transferChanged.emit()
+            self.programsChanged.emit()
+            if not error or self._transfer_uncertain:
+                self.refreshTransfer()
+        elif kind in {"status", "cancel"}:
+            self._transfer_polling = False
+            if kind == "status" and value["generation"] != (self._transfer_machine_id or self._send_machine_id):
+                self.transferChanged.emit()
+                self.programsChanged.emit()
+                return
+            if error:
+                self._transfer_uncertain = self._transfer_uncertain or self.transferBusy
+                self._transfer_message = "No se pudo confirmar el estado de " + (self._transfer_machine_name or "la CNC") + ". " + error
+            elif kind == "status":
+                status = result.get("status")
+                filename = str(result.get("filename") or "")
+                matches = filename == self._transfer_expected_filename
+                if status in {"success", "error", "cancelled"}:
+                    if not self._transfer_started or (matches and (self._send_acknowledged or self._observed_transfer)) or self._cancel_acknowledged:
+                        self._transfer_started = False
+                        self._transfer_uncertain = False
+                    else:
+                        self._transfer_uncertain = True
+                elif status == "sending":
+                    if self._transfer_started and not matches:
+                        self._transfer_uncertain = True
+                    else:
+                        self._transfer_started = True
+                        self._observed_transfer = True
+                        self._transfer_uncertain = False
+                        if not self._transfer_machine_id:
+                            self._transfer_machine_id = self._send_machine_id
+                            machine = self._machines.get(self._send_machine_id) or {}
+                            self._transfer_machine_name = machine.get("name", "CNC")
+                            self._transfer_expected_filename = filename
+                elif status == "idle" and self._cancel_acknowledged:
+                    self._transfer_started = False
+                    self._transfer_uncertain = False
+                elif status != "idle" or self._transfer_started:
+                    self._transfer_uncertain = True
+                self._transfer = {**result, "status": "unknown"} if self._transfer_uncertain else result
+                message = result.get("message") or {"idle": "Sin envío activo", "sending": "Enviando", "success": "Transferencia completada", "cancelled": "Envío cancelado", "error": "Error de envío"}.get(result.get("status"), "Estado desconocido")
+                self._transfer_message = ((self._transfer_machine_name + " · ") if self._transfer_machine_name else "") + message
+                if self._transfer_uncertain:
+                    self._transfer_message += " · El envío anterior sigue sin confirmar."
+            else:
+                self._cancel_acknowledged = True
+                self._transfer_message = "Cancelación solicitada; esperando confirmación de " + self._transfer_machine_name + "."
+            self.transferChanged.emit()
+            self.programsChanged.emit()
+            if kind == "cancel" and not error:
+                self.refreshTransfer()
 
     @Property(bool, notify=stateChanged)
     def running(self) -> bool:
@@ -186,6 +506,10 @@ class DesktopBackend(QObject):
     def discoveredDevices(self) -> list[dict[str, object]]:
         return self._devices
 
+    @Property("QVariantList", notify=presetterClientsChanged)
+    def presetterClients(self) -> list[dict]:
+        return self._runtime.presetter_clients
+
     @Property(str, notify=stateChanged)
     def discoveryStatus(self) -> str:
         if not self.running:
@@ -226,19 +550,27 @@ class DesktopBackend(QObject):
     def _append_activity(self, level: str, message: str) -> None:
         self._record(level, message)
 
-    def _save_config(self, config: AgentConfig, restart: bool = True) -> None:
+    def _save_config(self, config: AgentConfig, restart: bool = True) -> bool:
+        if self.transferBusy or self._transfer_uncertain or self.programBusy:
+            self._record("warning", "Espera a que termine la operación de programas antes de cambiar la conexión.")
+            return False
         was_running = self._runtime.running
         if was_running and restart:
             self._runtime.stop()
         Path(config.programs_dir).mkdir(parents=True, exist_ok=True)
         config.save(self._config_path)
         self._config = config
+        if self._program_host:
+            self._program_host.close()
         self._runtime = AgentRuntime(config, self._machines_path)
+        self._program_host = None
         self.configChanged.emit()
         if was_running and restart:
             self.start()
         else:
             self.stateChanged.emit()
+        self.browsePrograms("", "")
+        return True
 
     @Slot()
     def start(self) -> None:
@@ -247,6 +579,7 @@ class DesktopBackend(QObject):
         self._status = "Iniciando…"
         self._error = ""
         self.stateChanged.emit()
+        self.programsChanged.emit()
         try:
             self._runtime.start()
         except OSError as exc:
@@ -260,6 +593,7 @@ class DesktopBackend(QObject):
         else:
             self._status = "Activo"
         self.stateChanged.emit()
+        self.programsChanged.emit()
 
     @Slot()
     def stop(self) -> None:
@@ -269,6 +603,7 @@ class DesktopBackend(QObject):
         self._status = "Detenido"
         self._error = ""
         self.stateChanged.emit()
+        self.programsChanged.emit()
 
     @Slot()
     def restart(self) -> None:
@@ -284,7 +619,8 @@ class DesktopBackend(QObject):
         if not 1024 <= port <= 65535:
             self._record("error", "El puerto debe estar entre 1024 y 65535")
             return
-        self._save_config(replace(self._config, name=clean_name, port=port))
+        if not self._save_config(replace(self._config, name=clean_name, port=port)):
+            return
         self._record("info", "Configuración guardada")
 
     @Property(str, notify=machinesChanged)
@@ -298,6 +634,10 @@ class DesktopBackend(QObject):
 
     @Slot("QVariantMap", result=bool)
     def saveMachine(self, value) -> bool:
+        if str(dict(value).get("id", "")) == self._transfer_machine_id and (self.transferBusy or self._transfer_uncertain):
+            self._machine_error = "Espera a confirmar el envío antes de cambiar su máquina destino."
+            self.machinesChanged.emit()
+            return False
         try:
             saved = self._machines.save(dict(value))
         except MachineError as exc:
@@ -310,11 +650,15 @@ class DesktopBackend(QObject):
             self._runtime._sync.mark_dirty()
         self.syncChanged.emit()
         self.machinesChanged.emit()
+        self.programsChanged.emit()
         self._record("info", f"Máquina guardada: {saved['name']}")
         return True
 
     @Slot(str)
     def deleteMachine(self, machine_id: str) -> None:
+        if machine_id == self._transfer_machine_id and (self.transferBusy or self._transfer_uncertain):
+            self._record("warning", "Espera a confirmar el envío antes de eliminar su máquina destino.")
+            return
         machine = self._machines.get(machine_id)
         try:
             self._machines.delete(machine_id)
@@ -325,6 +669,7 @@ class DesktopBackend(QObject):
             self._runtime._sync.mark_dirty()
         self.syncChanged.emit()
         self.machinesChanged.emit()
+        self.programsChanged.emit()
         self._record("warning", f"Máquina eliminada: {(machine or {}).get('name', machine_id)}")
 
     @Property(str, notify=configChanged)
@@ -350,6 +695,10 @@ class DesktopBackend(QObject):
         return self._discovering
 
     def _refresh_workshop(self):
+        clients = self._runtime.presetter_clients
+        if clients != self._presetter_snapshot:
+            self._presetter_snapshot = clients
+            self.presetterClientsChanged.emit()
         values = self._machines.list()
         if values != self._machine_snapshot:
             self._machine_snapshot = values
@@ -364,7 +713,8 @@ class DesktopBackend(QObject):
         if not host or any(character in host for character in "/ :\\") or not 1 <= port <= 65535:
             self._record("error", "Usa el hostname o IPv4 del servidor y un puerto válido")
             return
-        self._save_config(replace(self._config, program_server_host=host, program_server_port=port))
+        if not self._save_config(replace(self._config, program_server_host=host, program_server_port=port)):
+            return
         self._record("info", f"Servidor de programas: {host}. Se conservarán los archivos borrados de la computadora.")
         self.syncChanged.emit()
 
@@ -544,7 +894,8 @@ class DesktopBackend(QObject):
         )
         if not selected:
             return
-        self._save_config(replace(self._config, programs_dir=str(Path(selected).resolve())))
+        if not self._save_config(replace(self._config, programs_dir=str(Path(selected).resolve()))):
+            return
         self._record("info", f"Carpeta cambiada a {selected}")
 
     @Slot()
@@ -555,7 +906,8 @@ class DesktopBackend(QObject):
     @Slot()
     def regeneratePairingCode(self) -> None:
         code = f"{secrets.randbelow(1_000_000):06d}"
-        self._save_config(replace(self._config, pairing_code=code))
+        if not self._save_config(replace(self._config, pairing_code=code)):
+            return
         self._record("info", "Se generó un nuevo código de emparejamiento")
 
     @Slot()
@@ -565,7 +917,8 @@ class DesktopBackend(QObject):
             api_token=secrets.token_urlsafe(32),
             pairing_code=f"{secrets.randbelow(1_000_000):06d}",
         )
-        self._save_config(config)
+        if not self._save_config(config):
+            return
         self._record("warning", "Se revocaron todos los accesos y se cambió el código")
 
     @Slot(str)
@@ -606,6 +959,10 @@ class DesktopBackend(QObject):
         self._sync_timer.stop()
         self._discovery_timer.stop()
         self._update_timer.stop()
+        self._transfer_timer.stop()
+        self._program_executor.shutdown(wait=False, cancel_futures=True)
+        if self._program_host:
+            self._program_host.close()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._runtime.stop()
         LOGGER.removeHandler(self._log_handler)

@@ -31,6 +31,8 @@ ApplicationWindow {
     property string editingMachineId: ""
     property var editingRevision: 0
     property var renamingDevice: ({})
+    property var pendingSend: ({})
+    property string editingRemoteMachineId: ""
 
     palette.window: color
     palette.windowText: textMain
@@ -47,6 +49,7 @@ ApplicationWindow {
         backend.beginMachineEdit()
         editingRevision = machine && machine.revision ? machine.revision : 0
         editingMachineId = machine && machine.id ? machine.id : ""
+        editingRemoteMachineId = machine && machine.dnc_machine_id ? machine.dnc_machine_id : ""
         machineNameField.text = machine && machine.name ? machine.name : ""
         machineHostField.text = machine && machine.dnc_host ? machine.dnc_host : ""
         machinePortField.value = machine && machine.dnc_port ? machine.dnc_port : 5000
@@ -66,6 +69,7 @@ ApplicationWindow {
         var saved = backend.saveMachine({
             "id": editingMachineId,
             "revision": editingRevision,
+            "dnc_machine_id": editingRemoteMachineId,
             "name": machineNameField.text,
             "dnc_host": machineHostField.text,
             "dnc_port": machinePortField.value,
@@ -159,6 +163,32 @@ ApplicationWindow {
         font.letterSpacing: 1.2
     }
 
+    component WorkspaceTab: TabButton {
+        id: control
+        implicitHeight: 42
+        font.pixelSize: 13
+        font.weight: Font.DemiBold
+        background: Rectangle {
+            color: control.checked ? window.skySoft : control.hovered ? window.raised : window.surface
+            border.color: control.activeFocus ? window.primary : window.border
+            border.width: control.activeFocus ? 2 : 1
+            Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: control.checked ? 3 : 0
+                color: window.primary
+            }
+        }
+        contentItem: Text {
+            text: control.text
+            font: control.font
+            color: control.checked ? window.primaryDark : window.textMuted
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+    }
+
     header: Rectangle {
         height: 76
         color: window.surface
@@ -233,9 +263,345 @@ ApplicationWindow {
         }
     }
 
+    TabBar {
+        id: workspaceTabs
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        Accessible.name: "Secciones de Zeuz Agent"
+        WorkspaceTab { text: "Programas"; Accessible.name: "Biblioteca de programas" }
+        WorkspaceTab { text: "Taller y conexión"; Accessible.name: "Máquinas, dispositivos y conexión" }
+    }
+
+    ColumnLayout {
+        id: programsWorkspace
+        objectName: "programsWorkspace"
+        anchors.top: workspaceTabs.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.margins: 18
+        spacing: 12
+        visible: workspaceTabs.currentIndex === 0
+
+        RowLayout {
+            Layout.fillWidth: true
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 3
+                SectionTitle { text: "BIBLIOTECA DE PROGRAMAS" }
+                Text {
+                    Layout.fillWidth: true
+                    text: backend.programSource
+                    color: textMuted
+                    font.pixelSize: 12
+                    elide: Text.ElideMiddle
+                }
+            }
+            TextButton {
+                text: "Actualizar"
+                enabled: !backend.programBusy
+                onClicked: backend.browsePrograms(backend.programPath, programSearchField.text)
+            }
+            ZeuzButton {
+                text: "Importar programas"
+                enabled: !backend.programBusy && !backend.transferBusy
+                onClicked: backend.importPrograms()
+            }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            TextButton {
+                text: "↑ Subir"
+                enabled: backend.programPath.length > 0 && !backend.programBusy
+                onClicked: {
+                    programSearchField.text = ""
+                    var parts = backend.programPath.split("/")
+                    parts.pop()
+                    backend.browsePrograms(parts.join("/"), "")
+                }
+            }
+            TextButton {
+                text: "Inicio"
+                enabled: !backend.programBusy
+                onClicked: { programSearchField.text = ""; backend.browsePrograms("", "") }
+            }
+            Text {
+                Layout.fillWidth: true
+                text: backend.programPath.length ? backend.programPath : "Todos los programas"
+                color: textMain
+                font.pixelSize: 13
+                elide: Text.ElideMiddle
+            }
+            TextField {
+                id: programSearchField
+                Layout.preferredWidth: 240
+                placeholderText: "Buscar programas…"
+                Accessible.name: "Buscar programas por nombre"
+                onTextEdited: programSearchTimer.restart()
+                onAccepted: backend.browsePrograms(backend.programPath, text)
+            }
+            Timer {
+                id: programSearchTimer
+                interval: 350
+                onTriggered: backend.browsePrograms(backend.programPath, programSearchField.text)
+            }
+        }
+
+        Text {
+            Layout.fillWidth: true
+            visible: backend.programError.length > 0
+            text: backend.programError
+            wrapMode: Text.Wrap
+            color: danger
+            font.pixelSize: 13
+            Accessible.role: Accessible.AlertMessage
+        }
+
+        SplitView {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            orientation: Qt.Horizontal
+
+            Card {
+                SplitView.minimumWidth: 230
+                SplitView.preferredWidth: 350
+                SplitView.fillHeight: true
+
+                ListView {
+                    id: programList
+                    objectName: "programList"
+                    anchors.fill: parent
+                    anchors.margins: 10
+                    clip: true
+                    spacing: 5
+                    model: backend.programEntries
+                    currentIndex: -1
+                    keyNavigationEnabled: true
+                    activeFocusOnTab: true
+                    Accessible.name: "Programas de la biblioteca"
+                    ScrollBar.vertical: ScrollBar {}
+                    delegate: ItemDelegate {
+                        required property var modelData
+                        required property int index
+                        width: programList.width
+                        height: 62
+                        highlighted: backend.selectedProgram.path === modelData.path
+                        Accessible.name: (modelData.isDirectory ? "Carpeta " : "Programa ") + modelData.name
+                        background: Rectangle {
+                            radius: 9
+                            color: parent.highlighted ? skySoft : parent.hovered ? raised : "transparent"
+                            border.color: parent.activeFocus ? primary : "transparent"
+                            border.width: 2
+                        }
+                        contentItem: RowLayout {
+                            spacing: 10
+                            Text {
+                                text: modelData.isDirectory ? "▸" : "NC"
+                                color: primary
+                                font.pixelSize: modelData.isDirectory ? 22 : 12
+                                font.weight: Font.Bold
+                                Layout.preferredWidth: 26
+                            }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 3
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: modelData.name
+                                    color: textMain
+                                    font.pixelSize: 13
+                                    font.weight: Font.DemiBold
+                                    elide: Text.ElideRight
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: programSearchField.text.length ? modelData.path : modelData.isDirectory ? "Carpeta" : (modelData.size / 1024).toFixed(1) + " KB · " + Qt.formatDateTime(new Date(modelData.modified * 1000), "dd/MM/yyyy HH:mm")
+                                    color: textMuted
+                                    font.pixelSize: 11
+                                    elide: Text.ElideRight
+                                }
+                            }
+                        }
+                        onClicked: {
+                            programList.currentIndex = index
+                            if (modelData.isDirectory) {
+                                programSearchField.text = ""
+                                backend.browsePrograms(modelData.path, "")
+                            } else {
+                                backend.previewProgram(modelData.path)
+                            }
+                        }
+                    }
+                    Label {
+                        anchors.centerIn: parent
+                        width: parent.width - 30
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.Wrap
+                        visible: programList.count === 0 && !backend.programBusy
+                        text: programSearchField.text.length ? "No hay programas con ese nombre." : "No hay programas en esta carpeta.\nImporta un programa para comenzar."
+                        color: textMuted
+                    }
+                }
+                BusyIndicator {
+                    anchors.centerIn: parent
+                    running: backend.programBusy
+                    visible: running
+                    Accessible.name: "Cargando programas"
+                }
+            }
+
+            Card {
+                SplitView.minimumWidth: 300
+                SplitView.fillWidth: true
+                SplitView.fillHeight: true
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 14
+                    spacing: 8
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text {
+                            Layout.fillWidth: true
+                            text: backend.selectedProgram.name || "Vista previa"
+                            color: textMain
+                            font.pixelSize: 14
+                            font.weight: Font.DemiBold
+                            elide: Text.ElideMiddle
+                        }
+                        Text {
+                            text: backend.selectedProgram.path ? (backend.selectedProgram.size / 1024).toFixed(1) + " KB" : ""
+                            color: textMuted
+                            font.pixelSize: 12
+                        }
+                    }
+                    Text {
+                        visible: !!backend.selectedProgram.truncated
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: "Vista previa de los primeros 2 MB. Se enviará el programa completo."
+                        color: warning
+                        font.pixelSize: 12
+                    }
+                    ScrollView {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        clip: true
+                        TextArea {
+                            id: programPreview
+                            objectName: "programPreview"
+                            readOnly: true
+                            selectByMouse: true
+                            text: backend.selectedProgram.content || ""
+                            placeholderText: "Selecciona un programa para ver su contenido."
+                            color: textMain
+                            font.family: Qt.platform.os === "windows" ? "Consolas" : Qt.platform.os === "osx" ? "Menlo" : "monospace"
+                            font.pixelSize: 14
+                            wrapMode: TextEdit.NoWrap
+                            background: Rectangle { color: "transparent" }
+                            Accessible.name: "Contenido del programa, solo lectura"
+                        }
+                    }
+                }
+            }
+        }
+
+        Card {
+            Layout.fillWidth: true
+            Layout.preferredHeight: transferColumn.implicitHeight + 28
+            ColumnLayout {
+                id: transferColumn
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 8
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: "ENVIAR A CNC"; color: primaryDark; font.pixelSize: 12; font.weight: Font.Bold }
+                    ComboBox {
+                        id: sendMachineBox
+                        objectName: "sendMachineBox"
+                        Layout.fillWidth: true
+                        model: backend.machines
+                        textRole: "name"
+                        valueRole: "id"
+                        enabled: !backend.transferBusy && !backend.transferUncertain
+                        displayText: currentIndex < 0 ? "Seleccionar máquina…" : currentText
+                        Accessible.name: "Máquina destino del programa"
+                        indicator: Text {
+                            x: parent.width - width - 10
+                            y: (parent.height - height) / 2
+                            text: "⌄"
+                            font.pixelSize: 20
+                            color: parent.enabled ? textMain : disabledText
+                        }
+                        onActivated: backend.setSendMachine(currentValue)
+                        onModelChanged: currentIndex = indexOfValue(backend.sendMachineId)
+                        Component.onCompleted: currentIndex = indexOfValue(backend.sendMachineId)
+                    }
+                    TextButton {
+                        text: "Consultar estado"
+                        enabled: !backend.transferPolling && (backend.transferMachineId.length > 0 || backend.sendMachineId.length > 0)
+                        onClicked: backend.refreshTransfer()
+                    }
+                    ZeuzButton {
+                        objectName: "sendProgramButton"
+                        text: "Enviar programa"
+                        enabled: backend.canSendProgram
+                        onClicked: {
+                            var machine = backend.machines.find(function(item) { return item.id === backend.sendMachineId })
+                            if (!machine) return
+                            pendingSend = {path: backend.selectedProgram.path, name: backend.selectedProgram.name, machineID: machine.id, machineName: machine.name}
+                            sendProgramDialog.open()
+                        }
+                    }
+                    TextButton {
+                        text: "Cancelar envío"
+                        labelColor: danger
+                        visible: backend.transferBusy || backend.transferUncertain
+                        enabled: !backend.transferPolling
+                        onClicked: backend.cancelTransfer()
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: backend.transferMessage
+                    color: backend.transferUncertain ? danger : textMuted
+                    font.pixelSize: 12
+                    wrapMode: Text.Wrap
+                }
+                ProgressBar {
+                    Layout.fillWidth: true
+                    visible: backend.transferBusy
+                    value: (backend.transfer.percent || 0) / 100
+                    Accessible.name: "Progreso de envío"
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: sendProgramDialog
+        title: "Enviar programa a la CNC"
+        anchors.centerIn: parent
+        modal: true
+        width: Math.min(440, window.width - 40)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        Label {
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "Se enviará «" + (pendingSend.name || "") + "» a «" + (pendingSend.machineName || "") + "».\n\nPon el control de la CNC en recepción antes de continuar."
+        }
+        onAccepted: backend.sendProgram(pendingSend.path, pendingSend.machineID)
+    }
+
     ScrollView {
         objectName: "workshopScroll"
-        anchors.fill: parent
+        anchors.top: workspaceTabs.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        visible: workspaceTabs.currentIndex === 1
         contentWidth: availableWidth
         clip: true
 
@@ -269,7 +635,7 @@ ApplicationWindow {
                             font.letterSpacing: 7
                         }
                         Text {
-                            text: "Introduce este código en ZeuzDNC para autorizar el dispositivo."
+                            text: "Introduce este código en ZeuzDNC o ZeuzPresetter para autorizar el dispositivo."
                             color: textMuted
                             font.pixelSize: 13
                             wrapMode: Text.Wrap
@@ -554,6 +920,13 @@ ApplicationWindow {
                                 text: backend.discovering ? "Buscando…" : "Actualizar dispositivos"
                                 enabled: !backend.discovering
                                 onClicked: backend.discoverDevices()
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                wrapMode: Text.Wrap
+                                color: backend.presetterClients.length ? success : textMuted
+                                font.pixelSize: 12
+                                text: backend.presetterClients.length ? "ZeuzPresetter conectado · " + backend.presetterClients.map(function(client) { return client.name + " (" + client.address + ")" }).join(", ") : "ZeuzPresetter · esperando conexión autorizada"
                             }
                             ListView {
                                 id: deviceList

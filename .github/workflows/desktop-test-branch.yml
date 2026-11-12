@@ -1,0 +1,113 @@
+name: Desktop apps test branch
+
+on:
+  push:
+    branches: [codex/desktop-apps-20261111]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QT_QPA_PLATFORM: offscreen
+  QT_QUICK_CONTROLS_STYLE: Basic
+
+jobs:
+  windows:
+    name: Windows Agent y Edit
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            portable-edit/pyproject.toml
+      - name: Preparar ambas aplicaciones
+        run: python -m pip install -e ".[package]" -e "./portable-edit[package]"
+      - name: Pruebas Agent
+        run: python -m unittest discover -s tests -q
+      - name: Pruebas Edit
+        run: python -m unittest discover -s portable-edit/tests -q
+      - name: Compilar Agent
+        run: python -m PyInstaller --noconfirm --clean packaging/zeuzagent.spec
+      - name: Compilar Edit
+        run: python -m PyInstaller --noconfirm --clean portable-edit/packaging/zeuzedit.spec
+      - name: Abrir y comprobar ejecutables empaquetados
+        run: python .github/scripts/verify_desktop_artifacts.py
+      - name: Preparar entregables Windows
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/ZeuzEdit -DestinationPath dist/ZeuzEdit-Windows-x86_64.zip -Force
+          foreach ($filename in @("ZeuzAgent.exe", "ZeuzEdit-Windows-x86_64.zip")) {
+            $hash = (Get-FileHash "dist/$filename" -Algorithm SHA256).Hash.ToLowerInvariant()
+            Set-Content -LiteralPath "dist/$filename.sha256" -Value "$hash  $filename" -Encoding ascii
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZeuzDesktop-Windows-x86_64
+          path: |
+            dist/ZeuzAgent.exe
+            dist/ZeuzAgent.exe.sha256
+            dist/ZeuzEdit-Windows-x86_64.zip
+            dist/ZeuzEdit-Windows-x86_64.zip.sha256
+            ci-validation/
+          if-no-files-found: error
+
+  linux:
+    name: Linux después de Windows
+    needs: windows
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            portable-edit/pyproject.toml
+      - name: Bibliotecas de escritorio Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 libdbus-1-3 libxcb-cursor0 libxcb-xinerama0 libxcb-keysyms1 libxcb-render-util0 libxcb-icccm4 libxcb-image0 libxkbcommon-x11-0 libfontconfig1
+      - name: Preparar ambas aplicaciones
+        run: python -m pip install -e '.[package]' -e './portable-edit[package]'
+      - name: Pruebas Agent
+        run: python -m unittest discover -s tests -q
+      - name: Pruebas Edit
+        run: python -m unittest discover -s portable-edit/tests -q
+      - name: Compilar Agent
+        run: python -m PyInstaller --noconfirm --clean packaging/zeuzagent.spec
+      - name: Compilar Edit
+        run: python -m PyInstaller --noconfirm --clean portable-edit/packaging/zeuzedit.spec
+      - name: Abrir y comprobar ejecutables empaquetados
+        run: python .github/scripts/verify_desktop_artifacts.py
+      - name: Preparar entregables Linux
+        run: |
+          mkdir -p build/ZeuzAgent-linux-x86_64
+          cp dist/ZeuzAgent build/ZeuzAgent-linux-x86_64/
+          cp src/zeuzagent/assets/app.png build/ZeuzAgent-linux-x86_64/zeuzagent.png
+          cp packaging/linux/install.sh packaging/linux/README.txt build/ZeuzAgent-linux-x86_64/
+          chmod +x build/ZeuzAgent-linux-x86_64/ZeuzAgent build/ZeuzAgent-linux-x86_64/install.sh
+          tar -czf dist/ZeuzAgent-linux-x86_64.tar.gz -C build ZeuzAgent-linux-x86_64
+          tar -czf dist/ZeuzEdit-Linux-x86_64.tar.gz -C dist ZeuzEdit
+          cd dist
+          sha256sum ZeuzAgent-linux-x86_64.tar.gz > ZeuzAgent-linux-x86_64.tar.gz.sha256
+          sha256sum ZeuzEdit-Linux-x86_64.tar.gz > ZeuzEdit-Linux-x86_64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZeuzDesktop-Linux-x86_64
+          path: |
+            dist/ZeuzAgent-linux-x86_64.tar.gz
+            dist/ZeuzAgent-linux-x86_64.tar.gz.sha256
+            dist/ZeuzEdit-Linux-x86_64.tar.gz
+            dist/ZeuzEdit-Linux-x86_64.tar.gz.sha256
+            ci-validation/
+          if-no-files-found: error

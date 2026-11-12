@@ -4,6 +4,27 @@ Zeuz Agent es el puente local entre la carpeta de programas CNC de una
 computadora y el resto del ecosistema Zeuz. Corre en Windows, macOS y Linux,
 publica una API HTTP local versionada y se anuncia por Bonjour/mDNS.
 
+## Biblioteca y envío desde la computadora
+
+La pestaña **Programas** de la interfaz Windows/Linux permite navegar por
+carpetas, buscar nombres, consultar el código e importar archivos. Muestra la
+biblioteca del servidor seleccionado; si no hay servidor, usa la carpeta de la
+computadora. La importación conserva los bytes originales y agrega un sufijo
+cuando el nombre ya existe. La vista previa muestra hasta 2 MiB; el envío usa
+el programa completo.
+
+Selecciona una CNC, pulsa **Enviar programa** y revisa el archivo y la máquina
+en la confirmación. Agent prepara una copia completa en el Zeuz cuando hace
+falta y consulta el progreso de esa misma CNC. **Cancelar envío** se dirige a
+esa máquina aunque se seleccione otro programa. Si se pierde la confirmación,
+el envío no se repite: se consulta su estado y se bloquean nuevas órdenes hasta
+confirmar el resultado. No se pueden cambiar ni eliminar los datos de esa CNC
+mientras tenga un envío pendiente de confirmar.
+
+**Taller y conexión** conserva emparejamiento, servidor, perfiles, dispositivos,
+actualizaciones y actividad. Cerrar la ventana deja el servidor en la bandeja
+cuando el escritorio la ofrece.
+
 ## Aplicación de escritorio
 
 La versión 0.4 incluye una interfaz Qt/QML para macOS y Windows que:
@@ -12,6 +33,7 @@ La versión 0.4 incluye una interfaz Qt/QML para macOS y Windows que:
 - sigue funcionando en la bandeja al cerrar la ventana;
 - muestra el código de emparejamiento y las direcciones de red;
 - permite elegir y abrir la carpeta de programas;
+- reconoce ZeuzPresetter autorizado y recibe archivos de seteos para un Zeuz seleccionado;
 - cambia el nombre visible del agente sin exponer puertos técnicos;
 - detecta Orange Pi/ZeuzDNC en la red local;
 - administra las máquinas del taller y su Orange Pi asignada;
@@ -88,6 +110,23 @@ Rutas con `Authorization: Bearer <token>`:
 - `POST /v1/dnc/send`
 - `GET /v1/dnc/transfer/status`
 - `POST /v1/dnc/send/cancel`
+- `POST /v1/presetter/register`
+- `GET /v1/presetter/clients`
+- `GET /v1/presetter/targets`
+- `POST /v1/presetter/jobs`
+
+ZeuzPresetter descubre Agent por Bonjour o su dirección local, se empareja con el
+mismo código y registra su presencia cada treinta segundos. Agent muestra la
+aplicación conectada mientras su registro no supere noventa segundos. Los destinos
+son las máquinas configuradas en Agent. La carga `{machine_id,filename,content}`
+se guarda con un nombre único en `Presetter/` de la biblioteca activa: el servidor
+compartido configurado en Agent, o la biblioteca local del Zeuz asignado cuando no
+hay servidor. La respuesta indica `library_host`, `library_port` y `storage_scope`
+(`workshop` o `device`). `status: "stored"` confirma almacenamiento;
+no inicia el envío por RS232. Requiere firmware ZeuzDNC con `/api/workshop/content`.
+El contenido debe ser ASCII, máximo 512 KiB, y el nombre debe terminar en `.txt`,
+`.nc` o `.tap`, sin carpetas. La presencia indica la aplicación conectada, no la
+conexión física de la regleta.
 
 ## Construir aplicación Windows
 
@@ -106,6 +145,19 @@ Para macOS o Linux:
 ```bash
 ./scripts/build_desktop.sh
 ```
+
+En Linux, este script agrega `dist/ZeuzAgent-linux-<arquitectura>.tar.gz`, con
+ejecutable, icono e instalación opcional para el usuario mediante `install.sh`.
+El flujo `.github/workflows/desktop-windows-linux.yml` compila y prueba
+Windows x86_64 y Linux x86_64; se ejecuta manualmente o en una pull request y
+guarda artefactos sin publicar un release. El build Linux de ese flujo requiere
+Ubuntu 22.04/glibc 2.35 o posterior. Los binarios deben construirse y probarse en
+su sistema operativo: las pruebas Qt locales en Mac no certifican un `.exe`
+Windows ni un ejecutable Linux.
+
+La nueva aplicación nativa Mac se construye desde el proyecto Xcode en
+`../native/macos/`; el empaquetado Qt anterior se conserva para las otras
+plataformas y no representa esa versión nativa.
 
 ## Pruebas
 
