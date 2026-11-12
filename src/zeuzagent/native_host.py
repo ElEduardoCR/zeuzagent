@@ -45,18 +45,25 @@ class TransferUncertain(RuntimeError):
 def local_addresses(port):
     values = set()
     try:
-        values.update(info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
-                      if not info[4][0].startswith("127."))
-    except OSError:
+        # Interface enumeration is local and does not wait for hostname DNS.
+        # ifaddr is already shipped with the Bonjour dependency.
+        import ifaddr
+        for adapter in ifaddr.get_adapters():
+            for address in adapter.ips:
+                value = address.ip
+                if isinstance(value, str) and not value.startswith("127.") and value != "0.0.0.0":
+                    values.add(value)
+    except (ImportError, OSError):
         pass
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
-            route.connect(("192.0.2.1", 9))
-            value = route.getsockname()[0]
-            if not value.startswith("127."):
-                values.add(value)
-    except OSError:
-        pass
+    if not values:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+                route.connect(("192.0.2.1", 9))
+                value = route.getsockname()[0]
+                if not value.startswith("127."):
+                    values.add(value)
+        except OSError:
+            pass
     return [{"url": f"http://{value}:{port}"} for value in sorted(values or {"127.0.0.1"})]
 
 
@@ -75,6 +82,7 @@ class ActivityHandler(logging.Handler):
 class NativeHost:
     def __init__(self, config_path=None, *, auto_start=True, discovery=True, background=True, runtime=None):
         self._lock = threading.RLock()
+        self._activity_lock = threading.Lock()
         self._mutations = threading.RLock()
         self._closed = threading.Event()
         self._discovery_enabled = discovery
@@ -121,7 +129,7 @@ class NativeHost:
         for secret in (self._config.api_token, self._config.pairing_code):
             if secret:
                 message = message.replace(secret, "[oculto]")
-        with self._lock:
+        with self._activity_lock:
             self._activity.appendleft({"time": datetime.now().strftime("%H:%M:%S"),
                                        "level": level, "message": message})
 
@@ -138,23 +146,34 @@ class NativeHost:
                 next_updates = now + 4
 
     def state(self):
+        # Never hold the host lock while entering runtime/registry locks or doing
+        # address lookup. Runtime and HTTP threads can log while holding their
+        # own locks; activity uses its own independent, leaf-only mutex.
         with self._lock:
             config, runtime = self._config, self._runtime
-            sync = runtime._sync
-            return {
-                "name": config.name, "programsDir": config.programs_dir,
-                "pairingCode": config.pairing_code, "running": runtime.running,
-                "status": self._status, "error": self._error,
-                "addresses": local_addresses(runtime.port),
-                "discoveryStatus": ("Bonjour activo" if runtime.discovery_active else "Bonjour no disponible")
-                                   if runtime.running else "Detenido",
-                "machines": self._machines.list(), "devices": copy.deepcopy(self._devices),
-                "presetterClients": runtime.presetter_clients, "activity": list(self._activity),
-                "syncStatus": sync.status if sync else "Agent detenido · sincronización en pausa",
-                "syncConflicts": copy.deepcopy(sync.conflicts) if sync else [],
-                "serverHost": config.program_server_host, "serverPort": config.program_server_port,
-                "version": __version__, "discovering": self._discovering,
-            }
+            status, error = self._status, self._error
+            devices, discovering = copy.deepcopy(self._devices), self._discovering
+        sync = runtime._sync
+        running = runtime.running
+        addresses = local_addresses(runtime.port)
+        discovery_active = runtime.discovery_active
+        machines = self._machines.list()
+        presetter_clients = runtime.presetter_clients
+        with self._activity_lock:
+            activity = list(self._activity)
+        return {
+            "name": config.name, "programsDir": config.programs_dir,
+            "pairingCode": config.pairing_code, "running": running,
+            "status": status, "error": error, "addresses": addresses,
+            "discoveryStatus": ("Bonjour activo" if discovery_active else "Bonjour no disponible")
+                               if running else "Detenido",
+            "machines": machines, "devices": devices,
+            "presetterClients": presetter_clients, "activity": activity,
+            "syncStatus": sync.status if sync else "Agent detenido · sincronización en pausa",
+            "syncConflicts": copy.deepcopy(sync.conflicts) if sync else [],
+            "serverHost": config.program_server_host, "serverPort": config.program_server_port,
+            "version": __version__, "discovering": discovering,
+        }
 
     def start(self):
         with self._mutations:
@@ -206,9 +225,10 @@ class NativeHost:
             if was_running:
                 self.start()
             raise
+        runtime = AgentRuntime(value, self._machines_path)
         with self._lock:
             self._config = value
-            self._runtime = AgentRuntime(value, self._machines_path)
+            self._runtime = runtime
         if was_running and not self.start()["ok"]:
             raise ValueError(self._error)
         self.record("info", "Configuración guardada")
@@ -266,11 +286,12 @@ class NativeHost:
                 return {"ok": True, "discovering": self._discovering}
             self._discovering = True
             known = {(d["host"], d["port"]): dict(d) for d in self._devices}
+            config = self._config
         for machine in self._machines.list():
             known.setdefault((machine["dnc_host"], machine["dnc_port"]),
                              {"host": machine["dnc_host"], "port": machine["dnc_port"], "name": machine["dnc_host"]})
-        if self._config.program_server_host:
-            host, port = self._config.program_server_host, self._config.program_server_port
+        if config.program_server_host:
+            host, port = config.program_server_host, config.program_server_port
             known.setdefault((host, port), {"host": host, "port": port, "name": host})
 
         def work():
@@ -483,7 +504,7 @@ class NativeHost:
         if method == "discover":
             return self.discover()
         if method == "activity.clear":
-            with self._lock:
+            with self._activity_lock:
                 self._activity.clear()
             return {"ok": True}
         with self._mutations:
@@ -552,7 +573,8 @@ class NativeHost:
                 with self._lock:
                     self._devices = [{**d, "name": name} if (d["host"], d["port"]) == (host, port)
                                      else d for d in self._devices]
-                    self._device_directory.save(self._devices)
+                    devices = copy.deepcopy(self._devices)
+                self._device_directory.save(devices)
                 return {"ok": True}
             if method.startswith("devices.update."):
                 action = method.rsplit(".", 1)[-1]

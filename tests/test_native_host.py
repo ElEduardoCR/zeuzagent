@@ -2,10 +2,13 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import socket
+import sys
 import tempfile
 import threading
+import types
 import unittest
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,7 +17,7 @@ from unittest.mock import patch
 
 from zeuzagent.config import AgentConfig
 from zeuzagent.library import MAX_PREVIEW_BYTES
-from zeuzagent.native_host import NativeHost, TransferUncertain, serve
+from zeuzagent.native_host import NativeHost, TransferUncertain, local_addresses, serve
 from zeuzagent.machines import MachineError, serial_profile
 from zeuzagent.runtime import AgentRuntime
 
@@ -54,6 +57,61 @@ class NativeHostTests(unittest.TestCase):
         self.assertNotIn(self.config.api_token, json.dumps(state))
         self.assertNotIn("api_token", state)
         self.assertEqual(original, self.config_path.read_bytes())
+
+    def test_activity_logging_completes_while_host_state_lock_is_busy(self):
+        completed = threading.Event()
+        def log():
+            logging.getLogger("zeuzagent").info("Concurrent activity fixture")
+            completed.set()
+        worker = threading.Thread(target=log, daemon=True)
+        try:
+            with self.host._lock:
+                worker.start()
+                self.assertTrue(completed.wait(1), "Activity logging waited for the host state lock")
+        finally:
+            worker.join(timeout=2)
+        self.assertTrue(completed.is_set())
+
+    def test_state_and_runtime_logging_cannot_invert_locks(self):
+        runtime = self.host._runtime
+        runtime_owned, state_entered = threading.Event(), threading.Event()
+        errors, results = [], []
+        def bounded_running(value):
+            state_entered.set()
+            # A bounded lock acquisition makes the old deadlock fail the test
+            # without stranding test workers or relying on arbitrary sleeps.
+            if not value._lock.acquire(timeout=1):
+                raise TimeoutError("State and runtime logging inverted their locks")
+            try:
+                return False
+            finally:
+                value._lock.release()
+        def runtime_owner():
+            try:
+                with runtime._lock:
+                    runtime_owned.set()
+                    if not state_entered.wait(2):
+                        raise TimeoutError("The state request did not reach the runtime")
+                    logging.getLogger("zeuzagent").info("Runtime logging fixture")
+            except Exception as exc:
+                errors.append(exc)
+        def read_state():
+            try:
+                results.append(self.host.state())
+            except Exception as exc:
+                errors.append(exc)
+        owner = threading.Thread(target=runtime_owner, daemon=True)
+        reader = threading.Thread(target=read_state, daemon=True)
+        with patch.object(AgentRuntime, "running", property(bounded_running)):
+            owner.start()
+            self.assertTrue(runtime_owned.wait(2))
+            reader.start()
+            owner.join(timeout=3)
+            reader.join(timeout=3)
+        self.assertFalse(owner.is_alive() or reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        self.assertTrue(any(event["message"] == "Runtime logging fixture" for event in results[0]["activity"]))
 
     def test_list_search_preview_and_export_use_existing_library(self):
         payload = b"%\nO1234\n" + b"G1 X10.\n" * (MAX_PREVIEW_BYTES // 8 + 5)
@@ -366,6 +424,29 @@ class APIUncertaintyTests(unittest.TestCase):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+class LocalAddressTests(unittest.TestCase):
+    def test_interface_addresses_do_not_resolve_hostnames(self):
+        adapter = types.SimpleNamespace(ips=[types.SimpleNamespace(ip=value) for value in
+            ["127.0.0.1", "0.0.0.0", "192.0.2.10", "192.0.2.10", ("fe80::1", 0, 0), "10.0.0.2"]])
+        fake = types.SimpleNamespace(get_adapters=lambda: [adapter])
+        with patch.dict(sys.modules, {"ifaddr": fake}), \
+             patch("zeuzagent.native_host.socket.getaddrinfo", side_effect=AssertionError("DNS must not run")), \
+             patch("zeuzagent.native_host.socket.socket") as route:
+            addresses = local_addresses(47820)
+        self.assertEqual(addresses, [{"url": "http://10.0.0.2:47820"}, {"url": "http://192.0.2.10:47820"}])
+        route.assert_not_called()
+
+    def test_numeric_route_fallback_does_not_resolve_hostnames(self):
+        fake = types.SimpleNamespace(get_adapters=lambda: [])
+        with patch.dict(sys.modules, {"ifaddr": fake}), \
+             patch("zeuzagent.native_host.socket.getaddrinfo", side_effect=AssertionError("DNS must not run")), \
+             patch("zeuzagent.native_host.socket.socket") as factory:
+            route = factory.return_value.__enter__.return_value
+            route.getsockname.return_value = ("192.0.2.20", 12345)
+            self.assertEqual(local_addresses(47820), [{"url": "http://192.0.2.20:47820"}])
+            route.connect.assert_called_once_with(("192.0.2.1", 9))
 
 
 if __name__ == "__main__":
