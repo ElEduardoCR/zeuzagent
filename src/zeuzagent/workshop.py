@@ -46,6 +46,7 @@ class WorkshopSync:
         self._cycle_lock = threading.Lock()
         self._thread = None
         self._generation = 0
+        self._released_servers: set[tuple[str, int]] = set()
 
     def request(self, method, path, body=None, endpoint=None):
         if self._stop.is_set():
@@ -123,6 +124,8 @@ class WorkshopSync:
                             failures.append(f"{host}: servidor pendiente · {exc}")
                 except Exception as exc:
                     failures.append(f"Programas: {exc}")
+            elif not self._stop.is_set():
+                self.release_pi_servers(destinations)
             if self._stop.is_set():
                 return
             self.persist()
@@ -132,6 +135,28 @@ class WorkshopSync:
             if self._generation != generation:
                 self.status = "Pendiente · hay cambios nuevos por confirmar"
                 self.wake()
+
+    def release_pi_servers(self, destinations):
+        """With the computer as the workshop server, no Pi relays sends.
+
+        A Pi that served the workshop before keeps its routes and copies of the
+        profiles; a phone that reached it while the computer was away got old
+        settings (a 38400 baud Fadal instead of 19200). Clear them once per run;
+        an offline Pi is retried on the next cycle (its sync already reports it).
+        """
+        for host, port in sorted(destinations):
+            if self._stop.is_set() or (host, port) in self._released_servers:
+                continue
+            endpoint = DNCEndpoint(host, port)
+            try:
+                info = self.request("GET", "/api/workshop/info", endpoint=endpoint)
+                if isinstance(info, dict) and (info.get("machine_routes") or info.get("program_server")):
+                    self.request("POST", "/api/workshop/configure", {"program_server": "", "machine_routes": []}, endpoint)
+                    LOGGER.info("%s dejó de actuar como servidor del taller", host)
+                self._released_servers.add((host, port))
+            except Exception as exc:  # noqa: BLE001 - retried on the next cycle
+                # Debug only: an offline Pi would otherwise flood the activity log.
+                LOGGER.debug("No se pudo quitar el modo servidor de %s: %s", host, exc)
 
     def peer_program_server_url(self, server):
         """Give peers a verified address even when they cannot resolve Bonjour.

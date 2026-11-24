@@ -56,9 +56,13 @@ class DiscoveryPublisher:
         return True
 
     def stop(self) -> None:
-        if self._zeroconf and self._info:
-            self._zeroconf.unregister_service(self._info)
-            self._zeroconf.close()
+        zeroconf, info = self._zeroconf, self._info
         self._zeroconf = None
         self._info = None
+        if zeroconf and info:
+            try:
+                zeroconf.unregister_service(info)
+            finally:
+                # Close the sockets even if the goodbye cannot reach the old network.
+                zeroconf.close()
 

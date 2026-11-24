@@ -8,6 +8,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from dataclasses import replace
@@ -353,6 +354,95 @@ class NativeHostTests(unittest.TestCase):
     def test_instance_lock_prevents_second_native_owner(self):
         with self.assertRaisesRegex(RuntimeError, "otra ventana"):
             NativeHost(self.config_path, auto_start=False, background=False)
+
+    def test_state_reports_new_programs_written_by_cam(self):
+        self.assertIsNone(self.host.state()["programsVersion"])
+        self.assertTrue(self.host.start()["ok"])
+        before = self.host.state()["programsVersion"]
+        self.assertIsInstance(before, int)
+        (self.programs / "1003.nc").write_text("%\nO1003\nM30\n%\n")
+        deadline = time.monotonic() + 6
+        while self.host.state()["programsVersion"] == before and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertGreater(self.host.state()["programsVersion"], before)
+
+    def test_forget_removes_only_offline_devices_without_machines(self):
+        def device(host, online=False):
+            return {"host": host, "port": 5000, "name": host, "address": "127.0.0.1", "online": online}
+        self.host.handle("machines.save", {"name": "Fadal", "id": "fadal", "dnc_host": "assigned.local", "dnc_port": 5000})
+        self.host._devices = [device("ghost.local"), device("assigned.local"), device("live.local", online=True)]
+        self.assertTrue(self.host.handle("devices.forget", {"host": "ghost.local", "port": 5000})["ok"])
+        self.assertNotIn("ghost.local", [d["host"] for d in self.host.state()["devices"]])
+        saved = json.loads(self.config_path.with_name("devices.json").read_text())["devices"]
+        self.assertEqual([d["host"] for d in saved], ["assigned.local", "live.local"])
+        with self.assertRaisesRegex(ValueError, "máquinas asignadas"):
+            self.host.handle("devices.forget", {"host": "assigned.local", "port": 5000})
+        with self.assertRaisesRegex(ValueError, "sin conexión"):
+            self.host.handle("devices.forget", {"host": "live.local", "port": 5000})
+
+        # A scan that started before the forget must not bring an offline ghost back,
+        # while a forgotten device that answers again returns normally.
+        scanned = [device("ghost.local"), device("assigned.local"), device("live.local", online=True)]
+        with patch("zeuzagent.native_host.scan_devices", return_value=(scanned, "")):
+            self.host.discover()
+            deadline = time.monotonic() + 5
+            while self.host.state()["discovering"] and time.monotonic() < deadline:
+                time.sleep(0.02)
+        self.assertNotIn("ghost.local", [d["host"] for d in self.host.state()["devices"]])
+        with patch("zeuzagent.native_host.scan_devices", return_value=([device("ghost.local", online=True)], "")):
+            self.host.discover()
+            deadline = time.monotonic() + 5
+            while self.host.state()["discovering"] and time.monotonic() < deadline:
+                time.sleep(0.02)
+        self.assertIn("ghost.local", [d["host"] for d in self.host.state()["devices"]])
+
+    def test_wake_and_network_change_announce_again_and_scan_soon(self):
+        monotonic = iter([100, 101, 102, 105, 111])
+        wall = iter([1000, 1001, 4602, 4605, 4611])
+        networks = iter([{"192.0.2.10"}, {"192.0.2.10"}, {"192.0.2.99"}])
+        ticks = [False, False, False, False, True]
+        now, scans, changes = {}, [], []
+
+        def clock():
+            now["value"] = next(monotonic)
+            return now["value"]
+
+        closed = types.SimpleNamespace(wait=lambda timeout: ticks.pop(0), is_set=lambda: False)
+        with patch.object(self.host, "_closed", closed), \
+             patch.object(self.host, "discover", side_effect=lambda: scans.append(now["value"])), \
+             patch.object(self.host, "_refresh_updates"), \
+             patch.object(self.host, "_network_changed", side_effect=changes.append):
+            self.host._schedule(clock=clock, wall_clock=lambda: next(wall), addresses=lambda: next(networks))
+        self.assertEqual(changes, ["La Mac despertó", "Cambió la red de la Mac"])
+        # The first scan after waking runs within seconds instead of the regular 30 s.
+        self.assertEqual(scans, [101, 105, 111])
+
+    def test_refresh_discovery_replaces_the_bonjour_announcement(self):
+        events = []
+
+        class Publisher:
+            def __init__(self, name, port):
+                self.number = len([e for e in events if e[0] == "new"]) + 1
+                events.append(("new", self.number))
+
+            def start(self):
+                events.append(("start", self.number))
+                return True
+
+            def stop(self):
+                events.append(("stop", self.number))
+
+        runtime = AgentRuntime(replace(self.config, discovery=True, port=free_port()), self.root / "runtime-machines.json")
+        runtime.refresh_discovery()
+        self.assertEqual(events, [])
+        with patch("zeuzagent.runtime.DiscoveryPublisher", Publisher):
+            runtime.start()
+            try:
+                runtime.refresh_discovery()
+                self.assertTrue(runtime.discovery_active)
+            finally:
+                runtime.stop()
+        self.assertEqual(events, [("new", 1), ("start", 1), ("new", 2), ("stop", 1), ("start", 2), ("stop", 2)])
 
     def test_loopback_end_to_end_full_local_program_and_explicit_machine(self):
         # Real HTTP from native host -> Agent v1 -> simulated ZeuzDNC. There is

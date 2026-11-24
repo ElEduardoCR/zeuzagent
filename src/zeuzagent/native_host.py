@@ -36,6 +36,9 @@ from .transfer_preparation import prepare_program_send, resolve_program_destinat
 
 LOGGER = logging.getLogger("zeuzagent")
 MAX_RPC_LINE_BYTES = 1024 * 1024
+# A scheduler tick that took this much longer on the wall clock than on the
+# monotonic clock means the Mac was asleep (macOS pauses the monotonic clock).
+WAKE_GAP_SECONDS = 15
 
 
 class TransferUncertain(RuntimeError):
@@ -43,7 +46,7 @@ class TransferUncertain(RuntimeError):
     uncertain = True
 
 
-def local_addresses(port):
+def interface_addresses():
     values = set()
     try:
         # Interface enumeration is local and does not wait for hostname DNS.
@@ -65,7 +68,11 @@ def local_addresses(port):
                     values.add(value)
         except OSError:
             pass
-    return [{"url": f"http://{value}:{port}"} for value in sorted(values or {"127.0.0.1"})]
+    return values
+
+
+def local_addresses(port):
+    return [{"url": f"http://{value}:{port}"} for value in sorted(interface_addresses() or {"127.0.0.1"})]
 
 
 class ActivityHandler(logging.Handler):
@@ -103,6 +110,7 @@ class NativeHost:
             self._devices = self._device_directory.load()
         except (OSError, ValueError):
             self._devices = []
+        self._forgotten = set()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="zeuz-native-background")
         self._log_handler = ActivityHandler(self) if self._owns_runtime else None
         if self._log_handler:
@@ -134,17 +142,43 @@ class NativeHost:
             self._activity.appendleft({"time": datetime.now().strftime("%H:%M:%S"),
                                        "level": level, "message": message})
 
-    def _schedule(self):
-        next_discovery = next_updates = 0.0
+    def _schedule(self, clock=time.monotonic, wall_clock=time.time, addresses=interface_addresses):
+        next_discovery = next_updates = next_network_check = fast_until = 0.0
+        last_tick, last_wall = clock(), wall_clock()
+        network = addresses()
         while not self._closed.wait(1):
-            now = time.monotonic()
+            now, wall = clock(), wall_clock()
+            woke = (wall - last_wall) - (now - last_tick) > WAKE_GAP_SECONDS
+            last_tick, last_wall = now, wall
+            moved = False
+            if now >= next_network_check:
+                current = addresses()
+                moved, network = current != network, current
+                next_network_check = now + 5
+            if woke or moved:
+                self._network_changed("La Mac despertó" if woke else "Cambió la red de la Mac")
+                # Wi-Fi may still be joining: look every few seconds for a minute.
+                fast_until = now + 60
+                next_discovery = min(next_discovery, now + 3)
             if now >= next_discovery:
                 if self._discovery_enabled:
                     self.discover()
-                next_discovery = now + 30
+                next_discovery = now + (5 if now < fast_until else 30)
             if now >= next_updates:
                 self._refresh_updates()
                 next_updates = now + 4
+
+    def _network_changed(self, reason):
+        self.record("info", reason + " · Agent se vuelve a anunciar y busca los equipos")
+        with self._lock:
+            runtime = self._runtime
+
+        def work():
+            try:
+                runtime.refresh_discovery()
+            except Exception as exc:
+                self.record("warning", "Bonjour: " + str(exc))
+        self._executor.submit(work)
 
     def state(self):
         # Never hold the host lock while entering runtime/registry locks or doing
@@ -174,6 +208,7 @@ class NativeHost:
             "syncConflicts": copy.deepcopy(sync.conflicts) if sync else [],
             "serverHost": config.program_server_host, "serverPort": config.program_server_port,
             "version": __version__, "discovering": discovering,
+            "programsVersion": runtime.library_version,
         }
 
     def start(self):
@@ -289,20 +324,28 @@ class NativeHost:
             self._discovering = True
             known = {(d["host"], d["port"]): dict(d) for d in self._devices}
             config = self._config
+        # Entries that machines or the program server use win when one device
+        # shows up under two names (see devices.merge_same_devices).
+        preferred = set()
         for machine in self._machines.list():
+            preferred.add((machine["dnc_host"], machine["dnc_port"]))
             known.setdefault((machine["dnc_host"], machine["dnc_port"]),
                              {"host": machine["dnc_host"], "port": machine["dnc_port"], "name": machine["dnc_host"]})
         if config.program_server_host:
             host, port = config.program_server_host, config.program_server_port
+            preferred.add((host, port))
             known.setdefault((host, port), {"host": host, "port": port, "name": host})
 
         def work():
             try:
-                devices, error = scan_devices(list(known.values()))
+                devices, error = scan_devices(list(known.values()), preferred=preferred)
                 if not self._closed.is_set():
-                    self._device_directory.save(devices)
                     with self._lock:
+                        # A device forgotten during this scan stays out unless it answered.
+                        devices = [d for d in devices if d.get("online") or (d["host"], d["port"]) not in self._forgotten]
+                        self._forgotten.difference_update((d["host"], d["port"]) for d in devices)
                         self._devices = devices
+                    self._device_directory.save(devices)
                     if error:
                         self.record("warning", "Bonjour: " + error)
             except Exception as exc:
@@ -493,6 +536,25 @@ class NativeHost:
             self._runtime._sync.mark_dirty()
         return {"ok": True, "machines": saved_values}
 
+    def _forget_device(self, host, port):
+        if any((m["dnc_host"], int(m["dnc_port"])) == (host, port) for m in self._machines.list()):
+            raise ValueError("Este equipo tiene máquinas asignadas. Muévelas o elimínalas antes de olvidarlo.")
+        if (self._config.program_server_host, self._config.program_server_port) == (host, port):
+            raise ValueError("Este equipo es el servidor de programas. Elige otro antes de olvidarlo.")
+        with self._lock:
+            device = next((d for d in self._devices if (d["host"], d["port"]) == (host, port)), None)
+            if device is None:
+                raise ValueError("Equipo no encontrado")
+            if device.get("online"):
+                raise ValueError("Solo se pueden olvidar equipos sin conexión")
+            self._forgotten.add((host, port))
+            self._devices = [d for d in self._devices if d is not device]
+            devices = copy.deepcopy(self._devices)
+        self._device_directory.save(devices)
+        ZeuzDNCProxy.forget_address(host)
+        self.record("info", f"Equipo olvidado: {device.get('name') or host}")
+        return {"ok": True}
+
     def handle(self, method, params=None):
         params = params or {}
         if not isinstance(params, dict):
@@ -592,6 +654,8 @@ class NativeHost:
                     devices = copy.deepcopy(self._devices)
                 self._device_directory.save(devices)
                 return {"ok": True}
+            if method == "devices.forget":
+                return self._forget_device(str(params["host"]), int(params.get("port", 5000)))
             if method.startswith("devices.update."):
                 action = method.rsplit(".", 1)[-1]
                 if action == "pair":

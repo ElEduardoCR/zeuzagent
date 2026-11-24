@@ -57,6 +57,44 @@ class AgentRuntime:
         with self._lock:
             return self._server.presetter_clients.list() if self._server else []
 
+    @property
+    def library_version(self) -> int | None:
+        """Change counter of the local program folder, bumped by its watcher."""
+        with self._lock:
+            watcher = self._watcher
+        return watcher.library.tracker.version if watcher else None
+
+    def refresh_discovery(self) -> None:
+        """Announce Agent again on the interfaces that exist now.
+
+        python-zeroconf keeps the sockets and addresses found at start-up, so a
+        Mac that slept or changed networks would keep publishing a stale IP.
+        """
+        with self._lock:
+            server = self._server
+            previous = self._discovery
+            if server is None or not self._config.discovery:
+                return
+            replacement = DiscoveryPublisher(self._config.name, server.server_port)
+            self._discovery = replacement
+        if previous:
+            try:
+                previous.stop()
+            except Exception:  # noqa: BLE001 - the old interfaces may already be gone
+                LOGGER.debug("No se pudo retirar el anuncio mDNS anterior", exc_info=True)
+        try:
+            active = replacement.start()
+        except Exception:  # noqa: BLE001 - mDNS must never prevent the API
+            LOGGER.exception("No se pudo publicar Zeuz Agent por mDNS")
+            active = False
+        with self._lock:
+            current = self._discovery is replacement
+            if current:
+                self._discovery_active = active
+        if not current:
+            # Agent stopped or refreshed again while this announcement started.
+            replacement.stop()
+
     def replace_config(self, **changes: object) -> AgentConfig:
         with self._lock:
             self._config = replace(self._config, **changes)

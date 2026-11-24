@@ -33,6 +33,32 @@ class ReturningClientTests(unittest.TestCase):
             self.assertIn("identidad verificada", found[0]["status"])
             self.assertEqual(ZeuzDNCProxy._addresses["zeuz.local"][0], "192.0.2.10")
 
+    def test_renamed_and_moved_device_keeps_its_machines(self):
+        # avahi renamed the Orange to zeuz-2.local after a name conflict and
+        # DHCP moved it; its machines still point to zeuz.local.
+        known = [dict(self.device)]
+        announced = DNCEndpoint("zeuz-2.local", 5000, "zeuz-2", "192.0.2.20",
+                                "Zeuz DNC en zeuz-2." + SERVICE_TYPE)
+
+        def info(address, port):
+            if address != "192.0.2.20":
+                raise OSError("timed out")
+            return self.info
+
+        def resolve(host):
+            if host == "zeuz-2.local":
+                return ["192.0.2.20"]
+            raise OSError("No DNS")
+
+        with patch("zeuzagent.devices._addresses", side_effect=resolve), patch("zeuzagent.devices._info", side_effect=info):
+            found, _ = scan_devices(known, discover=lambda **kwargs: [announced],
+                                    preferred={("zeuz.local", 5000)})
+        self.assertEqual([d["host"] for d in found], ["zeuz.local"])
+        self.assertTrue(found[0]["online"])
+        self.assertEqual(found[0]["address"], "192.0.2.20")
+        self.assertIn("zeuz-2.local", found[0]["status"])
+        self.assertEqual(ZeuzDNCProxy._addresses["zeuz.local"][0], "192.0.2.20")
+
     def test_saved_ip_reassigned_to_another_device_is_not_used(self):
         ZeuzDNCProxy.remember_address("zeuz.local", "192.0.2.10")
         with patch("zeuzagent.devices._addresses", side_effect=OSError("No DNS")), patch("zeuzagent.devices._info", return_value={**self.info, "device_id": "other-pi"}):
@@ -93,8 +119,11 @@ class RealMDNSLateJoinTests(unittest.TestCase):
             self.skipTest("zeroconf not installed")
         tag = uuid.uuid4().hex[:10]
         # Loopback only: these test advertisements never reach the workshop LAN.
+        # A private service type keeps an Agent running on this Mac from saving
+        # them as real ZeuzDNC devices.
+        test_type = "_zeuz-dnc-test._tcp.local."
         publisher = Zeroconf(interfaces=["127.0.0.1"], ip_version=IPVersion.V4Only)
-        services = [ServiceInfo(SERVICE_TYPE, f"test-{tag}-{n}.{SERVICE_TYPE}",
+        services = [ServiceInfo(test_type, f"test-{tag}-{n}.{test_type}",
                     server=f"test-{tag}-{n}.local.", addresses=[socket.inet_aton("127.0.0.1")],
                     port=5000+n, properties={"api": "1"}, host_ttl=1, other_ttl=1) for n in range(2)]
         clients = []
@@ -105,7 +134,8 @@ class RealMDNSLateJoinTests(unittest.TestCase):
         try:
             for service in services:
                 publisher.register_service(service)
-            with patch("zeroconf.Zeroconf", side_effect=fresh_client):
+            with patch("zeroconf.Zeroconf", side_effect=fresh_client), \
+                 patch("zeuzagent.dnc_proxy.SERVICE_TYPE", test_type):
                 first = ZeuzDNCProxy.discover_all(1.5)
                 self.assertEqual(len([e for e in first if tag in e.host]), 2)
                 # The browser and its sockets were closed; the Pi-side object

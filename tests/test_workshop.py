@@ -117,5 +117,63 @@ class PeerProgramServerTests(unittest.TestCase):
         probe.assert_not_called()
 
 
+class ComputerServerTests(unittest.TestCase):
+    """With the computer as the workshop server, no Pi keeps a server role."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.config = AgentConfig("Workshop", str(self.root / "programs"))
+        self.registry = MachineRegistry(self.root / "machines.json")
+        self.registry.save({"id": "hardinge", "name": "Hardinge", "dnc_host": "raspberry.local"})
+        self.registry.save({"id": "fadal", "name": "Fadal", "dnc_host": "orange.local"})
+        self.proxy = ZeuzDNCProxy()
+        self.sync = WorkshopSync(self.config, self.registry, self.proxy)
+        self.offline = set()
+
+    def forward(self, method, path, body=None, endpoint=None, **kwargs):
+        if endpoint.host in self.offline:
+            raise DNCProxyError("No se pudo contactar ZeuzDNC: timed out")
+        if path == "/api/workshop/info":
+            old_routes = [{"host": "orange.local", "port": 5000, "machines": [{"id": "fadal", "baudrate": 38400}]}]
+            return 200, {"ok": True, "program_server": "",
+                         "machine_routes": old_routes if endpoint.host == "raspberry.local" else []}
+        return 200, {"ok": True}
+
+    def test_old_pi_server_routes_are_cleared_once(self):
+        with patch.object(self.sync, "sync_machines"), \
+                patch.object(self.proxy, "forward", side_effect=self.forward) as calls:
+            self.sync.cycle()
+            self.sync.cycle()
+        configured = [c for c in calls.call_args_list if c.args[1] == "/api/workshop/configure"]
+        self.assertEqual(len(configured), 1)
+        self.assertEqual(configured[0].args[3].host, "raspberry.local")
+        self.assertEqual(configured[0].args[2], {"program_server": "", "machine_routes": []})
+        checks = [c for c in calls.call_args_list if c.args[1] == "/api/workshop/info"]
+        self.assertEqual(len(checks), 2, "Each Pi is checked once per run, not every cycle")
+
+    def test_offline_pi_is_released_when_it_returns(self):
+        self.offline.add("raspberry.local")
+        with patch.object(self.sync, "sync_machines"), \
+                patch.object(self.proxy, "forward", side_effect=self.forward) as calls:
+            self.sync.cycle()
+            self.offline.clear()
+            self.sync.cycle()
+        configured = [c.args[3].host for c in calls.call_args_list if c.args[1] == "/api/workshop/configure"]
+        self.assertEqual(configured, ["raspberry.local"])
+
+    def test_configured_pi_server_is_left_alone(self):
+        config = AgentConfig("Workshop", str(self.root / "programs"),
+                             program_server_host="raspberry.local", program_server_port=5000)
+        sync = WorkshopSync(config, self.registry, self.proxy)
+        with patch.object(sync, "release_pi_servers") as release, \
+                patch.object(sync, "sync_machines"), patch.object(sync, "sync_programs"), \
+                patch.object(sync, "peer_program_server_url", return_value="http://raspberry.local:5000"), \
+                patch.object(self.proxy, "forward", return_value=(200, {"ok": True})):
+            sync.cycle()
+        release.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

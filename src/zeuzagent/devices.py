@@ -115,7 +115,35 @@ def probe_device(device, *, announced=False):
     return result
 
 
-def scan_devices(known, *, discover=None):
+def merge_same_devices(devices, preferred=()):
+    """Keep one entry per physical device, matched by its device_id.
+
+    avahi renames a device after a name conflict (zeuz.local -> zeuz-2.local)
+    and DHCP can move it, so discovery may find it under a new name while the
+    machines still point to the old one. The entry the machines use stays and
+    takes the address where the device answers now; the duplicate is dropped.
+    Devices are in inventory order, with already known entries first.
+    """
+    groups = {}
+    for device in devices:
+        if device.get("device_id"):
+            groups.setdefault(device["device_id"], []).append(device)
+    duplicates = set()
+    for entries in groups.values():
+        if len(entries) < 2:
+            continue
+        keep = next((d for d in entries if (d["host"], d["port"]) in preferred), entries[0])
+        live = next((d for d in entries if d.get("online")), None)
+        if live is not None and live is not keep:
+            keep.update(address=live["address"], online=True, reachable=True,
+                        version=live.get("version") or keep.get("version"),
+                        status=f"Conectado · ahora se anuncia como {live['host']}")
+            ZeuzDNCProxy.remember_address(keep["host"], live["address"])
+        duplicates.update(id(d) for d in entries if d is not keep)
+    return [d for d in devices if id(d) not in duplicates]
+
+
+def scan_devices(known, *, discover=None, preferred=()):
     discover = discover or ZeuzDNCProxy.discover_all
     inventory = {(d["host"], d["port"]): dict(d) for d in known}
     announced = set()
@@ -134,5 +162,5 @@ def scan_devices(known, *, discover=None):
     # Probes of one sleeping/unreachable device cannot hold up the other Pi.
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(probe_device, d, announced=key in announced) for key, d in inventory.items()]
-        devices = [future.result() for future in futures]
+        devices = merge_same_devices([future.result() for future in futures], set(preferred))
     return sorted(devices, key=lambda d: d["name"].casefold()), error
