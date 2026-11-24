@@ -73,6 +73,9 @@ class ZeuzDNCProxy:
         path: str,
         body: dict[str, Any] | None = None,
         endpoint: DNCEndpoint | None = None,
+        *,
+        timeout: float = 12,
+        retry_reads: bool = True,
     ) -> tuple[int, Any]:
         for attempt in range(2):
             target = endpoint or self._resolve()
@@ -92,7 +95,7 @@ class ZeuzDNCProxy:
                 },
             )
             try:
-                with urllib.request.urlopen(request, timeout=12) as response:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     return response.status, json.load(response)
             except urllib.error.HTTPError as exc:
                 try:
@@ -101,7 +104,7 @@ class ZeuzDNCProxy:
                     payload = {"ok": False, "error": f"ZeuzDNC respondió HTTP {exc.code}"}
                 return exc.code, payload
             except (OSError, ValueError, json.JSONDecodeError) as exc:
-                if attempt == 0 and method == "GET":
+                if attempt == 0 and method == "GET" and retry_reads:
                     if endpoint is None:
                         with self._lock:
                             self._endpoint = None

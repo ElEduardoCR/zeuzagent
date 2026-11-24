@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .dnc_proxy import DNCEndpoint, DNCProxyError, ZeuzDNCProxy
+from .devices import DeviceDirectory, probe_device
 from .machines import MachineRegistry, serial_profile
 
 LOGGER = logging.getLogger("zeuzagent")
@@ -111,9 +112,10 @@ class WorkshopSync:
                 try:
                     server = DNCEndpoint(self.config.program_server_host, self.config.program_server_port)
                     self.sync_programs(server)
-                    url = f"http://{server.host}:{server.port}"
+                    url = self.peer_program_server_url(server)
                     for host, port in sorted(destinations):
-                        if (host, port) == (server.host, server.port):
+                        if ((host, port) == (server.host, server.port)
+                                or f"http://{host}:{port}" == url):
                             continue
                         try:
                             self.request("POST", "/api/workshop/configure", {"program_server": url}, DNCEndpoint(host, port))
@@ -130,6 +132,29 @@ class WorkshopSync:
             if self._generation != generation:
                 self.status = "Pendiente · hay cambios nuevos por confirmar"
                 self.wake()
+
+    def peer_program_server_url(self, server):
+        """Give peers a verified address even when they cannot resolve Bonjour.
+
+        Keep the configured hostname for Agent's own routing and future DHCP
+        recovery. A remembered IP is only usable after the existing discovery
+        probe verifies the saved device identity (or the resolved hostname on
+        first discovery). Failed verification leaves peers' existing settings
+        untouched. Custom transports retain their original URL contract.
+        """
+        canonical = f"http://{server.host}:{server.port}"
+        if not isinstance(self.proxy, ZeuzDNCProxy):
+            return canonical
+        try:
+            known = DeviceDirectory(self.registry.path.with_name("devices.json")).load()
+            device = next((d for d in known if (d["host"], d["port"]) == (server.host, server.port)),
+                          {"host": server.host, "port": server.port})
+            verified = probe_device(device)
+            if verified.get("online") and verified.get("address"):
+                return f"http://{verified['address']}:{server.port}"
+        except (OSError, ValueError) as exc:
+            raise DNCProxyError("No se pudo verificar la dirección del servidor de programas") from exc
+        raise DNCProxyError("No se pudo verificar la identidad o dirección del servidor de programas")
 
     def sync_machines(self, endpoint):
         if not self.registry.path.exists() and self.ledger.get("machines"):

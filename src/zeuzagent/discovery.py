@@ -6,6 +6,22 @@ import socket
 SERVICE_TYPE = "_zeuz-agent._tcp.local."
 
 
+def local_ipv4_addresses() -> list[bytes]:
+    """Publish reachable A records as well as SRV for Windows without Bonjour DNS."""
+    addresses: set[str] = set()
+    try:
+        addresses.update(info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET))
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))
+            addresses.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    return [socket.inet_aton(address) for address in sorted(addresses) if not address.startswith("127.") and address != "0.0.0.0"]
+
+
 class DiscoveryPublisher:
     def __init__(self, name: str, port: int) -> None:
         self.name = name
@@ -25,10 +41,13 @@ class DiscoveryPublisher:
             SERVICE_TYPE,
             service_name,
             port=self.port,
+            addresses=local_ipv4_addresses(),
             properties={
                 "api": "1",
                 "path": "/v1",
                 "pairing": "required",
+                "presetter": "1",
+                "presetter_upload": "library_only",
             },
             server=f"{hostname}.local.",
         )

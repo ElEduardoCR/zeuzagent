@@ -4,6 +4,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import time
 from pathlib import Path
 
 from zeuzagent.config import AgentConfig
@@ -81,6 +82,12 @@ class ServerTests(unittest.TestCase):
 
             def forward(self, method, path, body=None, endpoint=None):
                 self.calls.append((method, path, body, endpoint))
+                if path == "/api/info":
+                    return 200, {"service": "zeuz-dnc", "agent_configured": False}
+                if path == "/api/workshop/info":
+                    return 200, {"program_server": ""}
+                if path == "/api/workshop/mirror":
+                    return 200, {"ok": True, "sha256": body["sha256"]}
                 if path == "/api/workshop/machines":
                     return 200, [machine]
                 return 200, {"ok": True}
@@ -111,13 +118,17 @@ class ServerTests(unittest.TestCase):
         self.request(
             "POST", "/v1/dnc/machine/select", {"id": machine["id"]}, token="token-prueba"
         )
+        (Path(self.temp.name) / "O4000.nc").write_bytes(b"O4000\r\nM30\r\n")
         self.request(
             "POST", "/v1/dnc/send", {"path": "O4000.nc"}, token="token-prueba"
         )
-        self.assertEqual(proxy.calls[0][1], "/api/workshop/machines")
-        self.assertEqual(proxy.calls[1][1], "/api/machine/select")
-        method, path, body, endpoint = proxy.calls[2]
+        self.assertEqual([call[1] for call in proxy.calls], [
+            "/api/info", "/api/workshop/info", "/api/workshop/mirror",
+            "/api/workshop/machines", "/api/machine/select", "/api/send",
+        ])
+        method, path, body, endpoint = proxy.calls[-1]
         self.assertEqual((method, path), ("POST", "/api/send"))
+        self.assertEqual(body["path"], proxy.calls[2][2]["path"])
         self.assertEqual(body["machine"]["baudrate"], 4800)
         self.assertEqual(endpoint.host, "zeuz-dnc-a1.local")
 
@@ -125,6 +136,47 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.request("GET", "/v1/dnc/machines")
         self.assertEqual(error.exception.code, 401)
+
+    def test_update_check_waits_for_clock_sync_before_starting_check(self):
+        class Proxy:
+            def __init__(self): self.calls = []
+            def forward(self, method, path, body=None, endpoint=None, **options):
+                self.calls.append((method, path, body))
+                if path == "/api/system/clock/status":
+                    return 200, {"supported": True, "utc_unix": int(time.time()) - 86400, "phase": "idle"}
+                if path == "/api/system/clock/sync":
+                    return 200, {"supported": True, "utc_unix": int(time.time()), "phase": "succeeded",
+                                 "request_id": body["request_id"]}
+                return 200, {"phase": "checking"}
+        self.machines.save({"id": "fadal", "name": "Fadal", "dnc_host": "orange.invalid"})
+        proxy = Proxy()
+        self.server.dnc_proxy = proxy
+        _, result = self.request("POST", "/v1/dnc/update/check", {"machine_id": "fadal"}, token="token-prueba")
+        self.assertEqual(result["phase"], "checking")
+        self.assertEqual([call[:2] for call in proxy.calls], [
+            ("GET", "/api/system/clock/status"), ("POST", "/api/system/clock/sync"),
+            ("POST", "/api/update/check")])
+
+    def test_update_check_legacy_clock_is_optional_but_real_failure_stops_check(self):
+        self.machines.save({"id": "fadal", "name": "Fadal", "dnc_host": "orange.invalid"})
+        class Proxy:
+            def __init__(self, status): self.status, self.calls = status, []
+            def forward(self, method, path, body=None, endpoint=None, **options):
+                self.calls.append((method, path))
+                if path == "/api/system/clock/status":
+                    return self.status, {"error": "Reloj no disponible"}
+                return 200, {"phase": "checking"}
+        legacy = Proxy(404)
+        self.server.dnc_proxy = legacy
+        self.request("POST", "/v1/dnc/update/check", {"machine_id": "fadal"}, token="token-prueba")
+        self.assertEqual(legacy.calls[-1], ("POST", "/api/update/check"))
+        failed = Proxy(403)
+        self.server.dnc_proxy = failed
+        with self.assertRaises(urllib.error.HTTPError) as failure:
+            self.request("POST", "/v1/dnc/update/check", {"machine_id": "fadal"}, token="token-prueba")
+        self.assertEqual(failure.exception.code, 502)
+        self.assertIn("Reloj no disponible", failure.exception.read().decode())
+        self.assertEqual(failed.calls, [("GET", "/api/system/clock/status")])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ from typing import Iterable
 IGNORED_NAMES = {"Thumbs.db", "desktop.ini"}
 MAX_PREVIEW_BYTES = 2 * 1024 * 1024
 MAX_TRANSFER_BYTES = 128 * 1024 * 1024
+_WRITE_LOCKS: dict[str, threading.RLock] = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
 
 
 class LibraryError(Exception):
@@ -64,6 +66,22 @@ def _valid_name(name: str) -> bool:
     )
 
 
+def _advance_modified(path: str, previous: os.stat_result | None) -> os.stat_result:
+    """Keep the existing modified/expected_modified API safe on coarse clocks."""
+    current = os.stat(path)
+    if previous is None or current.st_mtime - previous.st_mtime > 0.000001:
+        return current
+    # Prefer a 1 ms advance. FAT and some mounted shares round timestamps to a
+    # two-second tick, so verify what the filesystem actually stored before
+    # replacing the original. Never publish an indistinguishable revision.
+    for step in (1_000_000, 2_000_000_000, 4_000_000_000):
+        os.utime(path, ns=(current.st_atime_ns, previous.st_mtime_ns + step))
+        current = os.stat(path)
+        if current.st_mtime - previous.st_mtime > 0.000001:
+            return current
+    raise OSError("La carpeta no permite distinguir las versiones del programa; se conservó el archivo anterior")
+
+
 @dataclass
 class ChangeTracker:
     version: int = 1
@@ -91,6 +109,8 @@ class ProgramLibrary:
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.tracker = tracker or ChangeTracker()
+        with _WRITE_LOCKS_GUARD:
+            self._write_lock = _WRITE_LOCKS.setdefault(str(self.root), threading.RLock())
 
     def resolve(self, relative_path: str | None, *, must_exist: bool = False) -> Path:
         raw = (relative_path or "").strip().replace("\\", "/").lstrip("/")
@@ -156,13 +176,15 @@ class ProgramLibrary:
         try:
             with target.open("rb") as handle:
                 raw = handle.read(MAX_PREVIEW_BYTES + 1)
+                # A concurrent atomic replacement must not pair old contents
+                # with the replacement file's revision.
+                stat = os.fstat(handle.fileno())
         except OSError as exc:
             raise LibraryError(str(exc)) from exc
         truncated = len(raw) > MAX_PREVIEW_BYTES
         raw = raw[:MAX_PREVIEW_BYTES]
         if _looks_binary(raw):
             raise UnsupportedFile("El archivo no es texto CNC compatible")
-        stat = target.stat()
         return {
             "name": target.name,
             "path": self.relative(target),
@@ -187,15 +209,20 @@ class ProgramLibrary:
             raise LibraryError(str(exc)) from exc
 
     def write(self, relative_path: str, content: str, *, expected_modified: float | None = None) -> dict:
+        # Native UI and HTTP handlers may hold separate library instances.
+        with self._write_lock:
+            return self._write(relative_path, content, expected_modified=expected_modified)
+
+    def _write(self, relative_path: str, content: str, *, expected_modified: float | None = None) -> dict:
         target = self.resolve(relative_path)
         if target.exists() and target.is_dir():
             raise InvalidPath("La ruta pertenece a una carpeta")
         if not _valid_name(target.name):
             raise InvalidPath("Nombre de programa inválido")
         target.parent.mkdir(parents=True, exist_ok=True)
-        if expected_modified is not None and target.exists():
-            actual = target.stat().st_mtime
-            if abs(actual - expected_modified) > 0.000001:
+        previous = target.stat() if target.exists() else None
+        if expected_modified is not None and previous is not None:
+            if abs(previous.st_mtime - expected_modified) > 0.000001:
                 raise Conflict("El programa cambió en otra computadora; vuelve a abrirlo")
         payload = content.encode("latin-1", errors="replace")
         try:
@@ -204,6 +231,7 @@ class ProgramLibrary:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
+            stat = _advance_modified(temp_name, previous)
             os.replace(temp_name, target)
         except OSError as exc:
             try:
@@ -212,7 +240,6 @@ class ProgramLibrary:
                 pass
             raise LibraryError(str(exc)) from exc
         version = self.tracker.bump()
-        stat = target.stat()
         return {
             "ok": True,
             "path": self.relative(target),
