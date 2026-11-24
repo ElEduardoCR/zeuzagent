@@ -417,6 +417,55 @@ class NativeHostTests(unittest.TestCase):
         # The first scan after waking runs within seconds instead of the regular 30 s.
         self.assertEqual(scans, [101, 105, 111])
 
+    def test_update_status_is_polled_every_minute_unless_an_update_runs(self):
+        monotonic = iter([100, 101, 105, 161, 165, 166])
+        ticks = [False, False, False, False, False, True]
+        now, polls = {}, []
+
+        def clock():
+            now["value"] = next(monotonic)
+            return now["value"]
+
+        def refresh():
+            polls.append(now["value"])
+            if now["value"] == 161:
+                # The user started an install on this Pi.
+                self.host._devices = [{"host": "pi.local", "port": 5000, "update": {"phase": "downloading"}}]
+
+        closed = types.SimpleNamespace(wait=lambda timeout: ticks.pop(0), is_set=lambda: False)
+        with patch.object(self.host, "_closed", closed), patch.object(self.host, "discover"), \
+             patch.object(self.host, "_refresh_updates", side_effect=refresh):
+            self.host._schedule(clock=clock, wall_clock=lambda: now.get("value", 100) + 1000,
+                                addresses=lambda: {"192.0.2.10"})
+        self.assertEqual(polls, [101, 161, 165])
+
+    def test_update_action_is_followed_on_the_next_tick(self):
+        self.host._devices = [{"host": "pi.local", "port": 5000}]
+        self.host._updates_due = float("inf")
+        with patch.object(self.host, "_remote", return_value={"phase": "waiting_idle"}):
+            self.host._update({"host": "pi.local", "port": 5000}, "install", {"revision": "a" * 40})
+        self.assertEqual(self.host._updates_due, 0.0)
+
+    def test_silent_client_does_not_hold_an_agent_thread(self):
+        from zeuzagent.library import ProgramLibrary
+        from zeuzagent.machines import MachineRegistry
+        from zeuzagent.server import ZeuzRequestHandler, create_server
+
+        with patch.object(ZeuzRequestHandler, "timeout", 0.3):
+            server = create_server(replace(self.config, port=0), ProgramLibrary(self.programs),
+                                   MachineRegistry(self.root / "timeout-machines.json"))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                # Connects and never sends a request, like a phone that slept.
+                with socket.create_connection(server.server_address, timeout=5) as client:
+                    started = time.monotonic()
+                    self.assertEqual(client.recv(1), b"")
+                    self.assertLess(time.monotonic() - started, 3)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_refresh_discovery_replaces_the_bonjour_announcement(self):
         events = []
 

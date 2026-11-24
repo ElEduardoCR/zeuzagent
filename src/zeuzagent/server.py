@@ -58,6 +58,9 @@ class ZeuzHTTPServer(ThreadingHTTPServer):
 
 class ZeuzRequestHandler(BaseHTTPRequestHandler):
     server: ZeuzHTTPServer
+    # A phone that sleeps or leaves the Wi-Fi mid-request leaves a half-open
+    # connection; without a limit it held one server thread forever.
+    timeout = 60
 
     def log_message(self, fmt: str, *args: Any) -> None:
         LOGGER.info("%s - %s", self.address_string(), fmt % args)

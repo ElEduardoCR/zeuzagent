@@ -39,6 +39,11 @@ MAX_RPC_LINE_BYTES = 1024 * 1024
 # A scheduler tick that took this much longer on the wall clock than on the
 # monotonic clock means the Mac was asleep (macOS pauses the monotonic clock).
 WAKE_GAP_SECONDS = 15
+# Update status of each ZeuzDNC: every minute while idle, every 4 s while an
+# update runs. Polling every 4 s all the time added needless Wi-Fi traffic.
+UPDATE_POLL_IDLE_SECONDS = 60
+UPDATE_POLL_ACTIVE_SECONDS = 4
+UPDATE_ACTIVE_PHASES = {"checking", "downloading", "waiting_idle", "installing", "restarting"}
 
 
 class TransferUncertain(RuntimeError):
@@ -111,6 +116,7 @@ class NativeHost:
         except (OSError, ValueError):
             self._devices = []
         self._forgotten = set()
+        self._updates_due = 0.0
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="zeuz-native-background")
         self._log_handler = ActivityHandler(self) if self._owns_runtime else None
         if self._log_handler:
@@ -164,9 +170,15 @@ class NativeHost:
                 if self._discovery_enabled:
                     self.discover()
                 next_discovery = now + (5 if now < fast_until else 30)
-            if now >= next_updates:
+            if now >= min(next_updates, self._updates_due):
                 self._refresh_updates()
-                next_updates = now + 4
+                next_updates = now + (UPDATE_POLL_ACTIVE_SECONDS if self._updates_active()
+                                      else UPDATE_POLL_IDLE_SECONDS)
+                self._updates_due = float("inf")
+
+    def _updates_active(self):
+        with self._lock:
+            return any(d.get("update", {}).get("phase") in UPDATE_ACTIVE_PHASES for d in self._devices)
 
     def _network_changed(self, reason):
         self.record("info", reason + " · Agent se vuelve a anunciar y busca los equipos")
@@ -392,6 +404,9 @@ class NativeHost:
             synchronize_clock(ZeuzDNCProxy(token=self._config.api_token), DNCEndpoint(host, port))
         value = self._remote("GET" if action == "status" else "POST", "/api/update/" + action,
                              body, DNCEndpoint(host, port))
+        if action != "status":
+            # Follow a check or an install closely from the next scheduler tick.
+            self._updates_due = 0.0
         with self._lock:
             for current in self._devices:
                 if (current["host"], current["port"]) == (host, port):
